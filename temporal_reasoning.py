@@ -1,362 +1,220 @@
 """
 Temporal Reasoning Module
-Implements LSTM-Attention Network for temporal pattern analysis
-and false alarm reduction through behavior understanding
 """
 
-import torch
-import torch.nn as nn
 import numpy as np
 from collections import deque
 import yaml
 
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
-class TemporalReasoningModule(nn.Module):
+
+# LSTM-Attention network 
+
+if TORCH_AVAILABLE:
+    class _LSTMAttentionNet(nn.Module):
+        def __init__(self, input_dim, hidden_size, num_heads):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_size=input_dim, hidden_size=hidden_size,
+                num_layers=2, batch_first=True,
+                dropout=0.2, bidirectional=True)
+            self.attention = nn.MultiheadAttention(
+                embed_dim=hidden_size * 2, num_heads=num_heads,
+                dropout=0.1, batch_first=True)
+            self.fc1     = nn.Linear(hidden_size * 2, 64)
+            self.fc2     = nn.Linear(64, 32)
+            self.fc3     = nn.Linear(32, 1)
+            self.relu    = nn.ReLU()
+            self.sigmoid = nn.Sigmoid()
+            self.dropout = nn.Dropout(0.3)
+
+        def forward(self, x, hidden=None):
+            lstm_out, new_hidden = self.lstm(x, hidden)
+            attn_out, attn_w = self.attention(lstm_out, lstm_out, lstm_out)
+            last = attn_out[:, -1, :]
+            out  = self.dropout(self.relu(self.fc1(last)))
+            out  = self.dropout(self.relu(self.fc2(out)))
+            score = self.sigmoid(self.fc3(out))
+            return score, attn_w, new_hidden
+
+
+class TemporalReasoningModule:
     """
-    LSTM-Attention Network for analyzing temporal patterns
-    Reduces false alarms by understanding behavior over time
+    Wraps the LSTM-Attention network.
     """
-    
+    INPUT_DIM = 7   # [child, fire, pool, cx, cy, vel, proximity]
+
     def __init__(self, config_path='config/config.yaml'):
-        super(TemporalReasoningModule, self).__init__()
-        
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        # Temporal parameters
-        self.buffer_size = self.config['temporal']['frame_buffer_size']
-        self.hidden_size = self.config['temporal']['lstm_hidden_size']
-        self.num_heads = self.config['temporal']['attention_heads']
-        
-        # Feature dimension (from detections)
-        # [child_present, fire_present, pool_present, 
-        #  child_x, child_y, child_velocity, proximity_score]
-        self.input_dim = 7
-        
-        # Frame buffer for temporal analysis
-        self.frame_buffer = deque(maxlen=self.buffer_size)
-        
-        # LSTM for sequence modeling
-        self.lstm = nn.LSTM(
-            input_size=self.input_dim,
-            hidden_size=self.hidden_size,
-            num_layers=2,
-            batch_first=True,
-            dropout=0.2,
-            bidirectional=True
-        )
-        
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=self.hidden_size * 2,  # *2 for bidirectional
-            num_heads=self.num_heads,
-            dropout=0.1,
-            batch_first=True
-        )
-        
-        # Output layers
-        self.fc1 = nn.Linear(self.hidden_size * 2, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, 1)  # Risk score output
-        
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-        self.dropout = nn.Dropout(0.3)
-        
-        # Hidden state
+
+        temporal_cfg = self.config.get('temporal', {})
+        self.buffer_size  = temporal_cfg.get('frame_buffer_size', 30)
+        self.hidden_size  = temporal_cfg.get('lstm_hidden_size',  64)
+        self.num_heads    = temporal_cfg.get('attention_heads',    4)
+
+        self.frame_buffer: deque = deque(maxlen=self.buffer_size)
         self.hidden = None
-        
+
+        if TORCH_AVAILABLE:
+            self.net = _LSTMAttentionNet(self.INPUT_DIM, self.hidden_size, self.num_heads)
+            self.net.eval()
+        else:
+            self.net = None
+
+
     def extract_features(self, detections):
-        """Extract temporal features from detection results"""
-        features = np.zeros(self.input_dim)
-        
-        # Binary presence indicators
-        features[0] = 1.0 if len(detections['child']) > 0 else 0.0
-        features[1] = 1.0 if len(detections['fire']) > 0 else 0.0
-        features[2] = 1.0 if len(detections['pool']) > 0 else 0.0
-        
-        # Child position and velocity (if detected)
-        if len(detections['child']) > 0:
-            child = detections['child'][0]  # Primary child
-            center = child['center']
-            
-            # Normalized position (0-1)
-            features[3] = center[0] / 1280.0  # Assuming 1280x720
-            features[4] = center[1] / 720.0
-            
-            # Calculate velocity from previous frame
-            if len(self.frame_buffer) > 0:
-                prev_features = self.frame_buffer[-1]
-                if prev_features[0] == 1.0:  # Child was detected before
-                    dx = features[3] - prev_features[3]
-                    dy = features[4] - prev_features[4]
-                    features[5] = np.sqrt(dx**2 + dy**2)  # Velocity magnitude
-        
-        # Proximity score (calculated from spatial analysis)
-        features[6] = self._calculate_proximity_score(detections)
-        
-        return features
-    
-    def _calculate_proximity_score(self, detections):
-        """Calculate proximity between child and hazards"""
-        if len(detections['child']) == 0:
+        feat = np.zeros(self.INPUT_DIM, dtype=np.float32)
+
+        feat[0] = 1.0 if detections.get('child') else 0.0
+        feat[1] = 1.0 if detections.get('fire')  else 0.0
+        feat[2] = 1.0 if detections.get('pool')  else 0.0
+
+        children = detections.get('child', [])
+        if children:
+            cx, cy = children[0]['center']
+            feat[3] = cx / 1280.0
+            feat[4] = cy / 720.0
+            if self.frame_buffer and self.frame_buffer[-1][0] == 1.0:
+                feat[5] = float(np.hypot(feat[3] - self.frame_buffer[-1][3],
+                                         feat[4] - self.frame_buffer[-1][4]))
+
+        feat[6] = self._proximity_score(detections)
+        return feat
+
+    def _proximity_score(self, detections):
+        if not detections.get('child'):
             return 0.0
-        
-        child_center = np.array(detections['child'][0]['center'])
-        max_proximity = 0.0
-        
-        # Check proximity to fire
-        for fire in detections['fire']:
-            fire_center = np.array(fire['center'])
-            distance = np.linalg.norm(child_center - fire_center)
-            # Normalize by image diagonal
-            normalized_dist = distance / np.sqrt(1280**2 + 720**2)
-            proximity = 1.0 - normalized_dist
-            max_proximity = max(max_proximity, proximity)
-        
-        # Check proximity to pool
-        for pool in detections['pool']:
-            pool_center = np.array(pool['center'])
-            distance = np.linalg.norm(child_center - pool_center)
-            normalized_dist = distance / np.sqrt(1280**2 + 720**2)
-            proximity = 1.0 - normalized_dist
-            max_proximity = max(max_proximity, proximity)
-        
-        return max_proximity
-    
+        child_c = np.array(detections['child'][0]['center'])
+        diag    = np.hypot(1280, 720)
+        best    = 0.0
+        for h_type in ('fire', 'pool'):
+            for h in detections.get(h_type, []):
+                d = np.linalg.norm(child_c - np.array(h['center']))
+                best = max(best, 1.0 - d / diag)
+        return float(best)
+
     def update_buffer(self, features):
-        """Add new frame features to temporal buffer"""
         self.frame_buffer.append(features)
-    
-    def forward(self, sequence):
-        """
-        Forward pass through temporal reasoning network
-        
-        Args:
-            sequence: Tensor of shape (batch, seq_len, input_dim)
-            
-        Returns:
-            risk_score: Temporal risk assessment (0-1)
-        """
-        # LSTM processing
-        lstm_out, self.hidden = self.lstm(sequence, self.hidden)
-        
-        # Self-attention over temporal sequence
-        attn_out, attn_weights = self.attention(
-            lstm_out, lstm_out, lstm_out
-        )
-        
-        # Take the last timestep output
-        last_out = attn_out[:, -1, :]
-        
-        # Fully connected layers
-        x = self.relu(self.fc1(last_out))
-        x = self.dropout(x)
-        x = self.relu(self.fc2(x))
-        x = self.dropout(x)
-        risk_score = self.sigmoid(self.fc3(x))
-        
-        return risk_score, attn_weights
-    
+
+    def forward(self, sequence_tensor):
+        if self.net is None or not TORCH_AVAILABLE:
+            return 0.0, None
+
+        import torch
+        with torch.no_grad():
+            # FIX: detach hidden state to avoid BPTT graph accumulation
+            if self.hidden is not None:
+                self.hidden = tuple(h.detach() for h in self.hidden)
+            score, attn_w, self.hidden = self.net(sequence_tensor, self.hidden)
+        return float(score.item()), attn_w
+
     def analyze_temporal_pattern(self, detections):
-        """
-        Analyze temporal pattern and return risk assessment
-        
-        Args:
-            detections: Current frame detections
-            
-        Returns:
-            temporal_risk: Risk score based on temporal analysis
-            pattern_type: Type of detected pattern
-        """
-        # Extract features
         features = self.extract_features(detections)
         self.update_buffer(features)
-        
-        # Need minimum frames for analysis
-        if len(self.frame_buffer) < 10:
+
+        min_frames = 10
+        if len(self.frame_buffer) < min_frames:
             return 0.0, "insufficient_data"
-        
-        # Convert buffer to tensor
-        sequence = np.array(list(self.frame_buffer))
-        sequence_tensor = torch.FloatTensor(sequence).unsqueeze(0)
-        
-        # Get risk score
-        with torch.no_grad():
-            risk_score, attn_weights = self.forward(sequence_tensor)
-        
-        temporal_risk = risk_score.item()
-        
-        # Classify pattern type
-        pattern_type = self._classify_pattern(sequence, temporal_risk)
-        
-        return temporal_risk, pattern_type
-    
+
+        if self.net is not None and TORCH_AVAILABLE:
+            import torch
+            seq    = torch.FloatTensor(np.array(self.frame_buffer)).unsqueeze(0)
+            risk,_ = self.forward(seq)
+        else:
+            # Heuristic fallback
+            seq  = np.array(self.frame_buffer)
+            risk = float(np.mean(seq[:, 6]) * (1 + float(np.mean(seq[:, 5])) * 5))
+            risk = min(1.0, risk)
+
+        pattern = self._classify_pattern(np.array(self.frame_buffer), risk)
+        return risk, pattern
+
     def _classify_pattern(self, sequence, risk_score):
-        """Classify the type of temporal pattern"""
-        # Check for approach pattern (increasing proximity)
-        proximity_trend = sequence[-10:, 6]  # Last 10 frames proximity
-        
-        if np.mean(proximity_trend[-5:]) > np.mean(proximity_trend[:5]):
-            if risk_score > 0.7:
-                return "dangerous_approach"
-            else:
-                return "cautious_approach"
-        
-        # Check for lingering near hazard
-        if np.mean(proximity_trend) > 0.6 and np.std(proximity_trend) < 0.1:
+        # FIX: guard against short sequences
+        n = len(sequence)
+        if n < 5:
+            return "insufficient_data"
+
+        prox = sequence[:, 6]
+        half = max(1, n // 2)
+
+        if np.mean(prox[-half:]) > np.mean(prox[:half]):
+            return "dangerous_approach" if risk_score > 0.7 else "cautious_approach"
+
+        if np.mean(prox) > 0.6 and np.std(prox) < 0.1:
             return "lingering_near_hazard"
-        
-        # Check for rapid movement
-        velocity_trend = sequence[-10:, 5]
-        if np.mean(velocity_trend) > 0.05:
+
+        if n >= 10 and np.mean(sequence[-10:, 5]) > 0.05:
             return "rapid_movement"
-        
-        # Check for transient detection (false alarm indicator)
-        child_presence = sequence[-10:, 0]
-        if np.sum(child_presence) < 5:  # Detected in less than half frames
+
+        child_frames = sequence[-min(10, n):, 0]
+        if np.sum(child_frames) < len(child_frames) / 2:
             return "transient_detection"
-        
-        # Stable safe situation
-        if risk_score < 0.3 and np.std(proximity_trend) < 0.1:
-            return "stable_safe"
-        
-        return "normal_activity"
-    
+
+        return "stable_safe" if risk_score < 0.3 else "normal_activity"
+
     def reset_buffer(self):
-        """Clear temporal buffer"""
         self.frame_buffer.clear()
         self.hidden = None
-    
+
     def get_trajectory_prediction(self):
-        """Predict future trajectory based on recent movement"""
         if len(self.frame_buffer) < 5:
             return None
-        
-        recent_features = np.array(list(self.frame_buffer)[-5:])
-        
-        # Extract positions
-        positions = recent_features[:, 3:5]
-        
-        # Simple linear extrapolation
+        recent = np.array(self.frame_buffer)[-5:]
+        positions = recent[:, 3:5]
         if len(positions) >= 2:
-            velocity = positions[-1] - positions[-2]
-            
-            # Predict next 2 seconds (60 frames)
-            predicted_positions = []
-            current_pos = positions[-1]
-            
-            for i in range(60):
-                next_pos = current_pos + velocity
-                predicted_positions.append(next_pos)
-                current_pos = next_pos
-            
-            return np.array(predicted_positions)
-        
+            vel = positions[-1] - positions[-2]
+            preds, cur = [], positions[-1].copy()
+            for _ in range(60):
+                cur = cur + vel
+                preds.append(cur.copy())
+            return np.array(preds)
         return None
 
 
+
+
 class TemporalPatternAnalyzer:
-    """High-level temporal pattern analysis coordinator"""
-    
     def __init__(self, config_path='config/config.yaml'):
         self.reasoning_module = TemporalReasoningModule(config_path)
-        
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        self.temporal_threshold = self.config['temporal']['temporal_threshold']
-        
-        # Pattern history
-        self.pattern_history = deque(maxlen=100)
-    
+        temporal_cfg = self.config.get('temporal', {})
+        self.temporal_threshold = temporal_cfg.get('temporal_threshold', 0.6)
+        self.pattern_history: deque = deque(maxlen=100)
+
     def analyze(self, detections):
-        """
-        Perform complete temporal analysis
-        
-        Returns:
-            analysis_result: Dictionary with temporal analysis results
-        """
-        temporal_risk, pattern_type = self.reasoning_module.analyze_temporal_pattern(
-            detections
-        )
-        
-        # Get trajectory prediction
+        temporal_risk, pattern_type = self.reasoning_module.analyze_temporal_pattern(detections)
         trajectory = self.reasoning_module.get_trajectory_prediction()
-        
-        # Record pattern
-        self.pattern_history.append({
-            'risk': temporal_risk,
-            'pattern': pattern_type
-        })
-        
-        # Determine if situation is genuinely hazardous
+        self.pattern_history.append({'risk': temporal_risk, 'pattern': pattern_type})
+
         is_hazardous = (
-            temporal_risk > self.temporal_threshold and
-            pattern_type in ['dangerous_approach', 'lingering_near_hazard']
+            temporal_risk > self.temporal_threshold and pattern_type in ('dangerous_approach', 'lingering_near_hazard')
         )
-        
-        analysis_result = {
-            'temporal_risk': temporal_risk,
-            'pattern_type': pattern_type,
-            'is_hazardous': is_hazardous,
-            'trajectory': trajectory,
-            'confidence': self._calculate_confidence()
+
+        return {
+            'temporal_risk':  temporal_risk,
+            'pattern_type':   pattern_type,
+            'is_hazardous':   is_hazardous,
+            'trajectory':     trajectory,
+            'confidence':     self._confidence(),
         }
-        
-        return analysis_result
-    
-    def _calculate_confidence(self):
-        """Calculate confidence in analysis based on consistency"""
+
+    def _confidence(self):
         if len(self.pattern_history) < 10:
             return 0.5
-        
-        recent_patterns = [p['pattern'] for p in list(self.pattern_history)[-10:]]
-        
-        # Higher confidence if patterns are consistent
         from collections import Counter
-        pattern_counts = Counter(recent_patterns)
-        most_common_count = pattern_counts.most_common(1)[0][1]
-        
-        confidence = most_common_count / 10.0
-        return confidence
-    
+        recent   = [p['pattern'] for p in list(self.pattern_history)[-10:]]
+        top_cnt  = Counter(recent).most_common(1)[0][1]
+        return top_cnt / 10.0
+
     def reset(self):
-        """Reset analyzer state"""
         self.reasoning_module.reset_buffer()
         self.pattern_history.clear()
-
-
-def main():
-    """Test temporal reasoning module"""
-    print("\n" + "="*60)
-    print("TEMPORAL REASONING MODULE TEST")
-    print("="*60)
-    
-    analyzer = TemporalPatternAnalyzer()
-    
-    # Simulate detection sequence
-    print("\nSimulating temporal pattern analysis...")
-    
-    for i in range(50):
-        # Dummy detections
-        detections = {
-            'child': [{'center': (640 + i*5, 360), 'bbox': [600, 300, 680, 420]}] if i % 3 != 0 else [],
-            'fire': [{'center': (800, 400)}] if i > 30 else [],
-            'pool': []
-        }
-        
-        result = analyzer.analyze(detections)
-        
-        if i % 10 == 0:
-            print(f"\nFrame {i}:")
-            print(f"  Temporal Risk: {result['temporal_risk']:.3f}")
-            print(f"  Pattern Type: {result['pattern_type']}")
-            print(f"  Is Hazardous: {result['is_hazardous']}")
-            print(f"  Confidence: {result['confidence']:.3f}")
-    
-    print("\n✓ Temporal reasoning module test complete")
-
-
-if __name__ == "__main__":
-    main()

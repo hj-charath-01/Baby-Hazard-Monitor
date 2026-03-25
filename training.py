@@ -1,6 +1,5 @@
 """
-Comprehensive YOLOv8 Training Script
-Production-ready training for child, fire, and pool detection models
+YOLOv8 Training for child, fire, and pool detection models
 """
 
 import os
@@ -18,9 +17,6 @@ import seaborn as sns
 
 
 class YOLOTrainer:
-    """
-    Production-ready YOLO trainer with comprehensive features
-    """
     
     def __init__(self, model_name='yolov8n.pt', config_path='config/config.yaml'):
         """
@@ -97,16 +93,14 @@ class YOLOTrainer:
         
         # Save YAML file
         yaml_path = data_dir / 'data.yaml'
-        with open(yaml_path, 'w') as f:
-            yaml.dump(yaml_content, f, default_flow_style=False)
+        with open(yaml_path, 'w') as f: yaml.dump(yaml_content, f, default_flow_style=False)
         
         print(f"Created dataset YAML: {yaml_path}")
         return yaml_path
     
-    def train_model(self, data_yaml, output_name, epochs=100, 
-                   patience=15, save_period=10, **kwargs):
+    def train_model(self, data_yaml, output_name, epochs=100,  patience=15, save_period=10, **kwargs):
         """
-        Train YOLO model with comprehensive settings
+        Train YOLO model with settings
         
         Args:
             data_yaml: Path to dataset YAML file
@@ -283,7 +277,7 @@ class YOLOTrainer:
 
 class TrainingOrchestrator:
     """
-    Orchestrate training for all detection models
+    training for all detection models
     """
     
     def __init__(self):
@@ -488,8 +482,7 @@ class TrainingOrchestrator:
         ax.grid(axis='y', alpha=0.3)
         for bar in bars:
             height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.3f}', ha='center', va='bottom')
+            ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.3f}', ha='center', va='bottom')
         
         # Recall
         ax = axes[1, 1]
@@ -500,8 +493,7 @@ class TrainingOrchestrator:
         ax.grid(axis='y', alpha=0.3)
         for bar in bars:
             height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.3f}', ha='center', va='bottom')
+            ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.3f}', ha='center', va='bottom')
         
         plt.tight_layout()
         
@@ -518,6 +510,7 @@ def main():
         description='Train Baby Hazard Detection Models',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+        
 Examples:
   # Train all models with 100 epochs
   python training.py --all --epochs 100

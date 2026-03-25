@@ -406,10 +406,10 @@ class AdaptiveRoomMapper:
                 heatmap_visual = (heatmap_visual / heatmap_visual.max() * 255).astype(np.uint8)
             
             # Apply colormap
-            # heatmap_color = cv2.applyColorMap(heatmap_visual, cv2.COLORMAP_JET)
+            heatmap_color = cv2.applyColorMap(heatmap_visual, cv2.COLORMAP_JET)
             
             # Blend with frame
-            # vis_frame = cv2.addWeighted(vis_frame, 0.7, heatmap_color, 0.3, 0)
+            vis_frame = cv2.addWeighted(vis_frame, 0.7, heatmap_color, 0.3, 0)
         
         # Draw persistent hazards
         for hazard in self.room_map['persistent_hazards']:

@@ -1,6 +1,5 @@
 """
-Inference and Testing Utilities
-Comprehensive testing tools for trained models
+Inference and testing for trained models
 """
 
 import cv2
@@ -16,7 +15,7 @@ from collections import defaultdict
 
 
 class ModelInference:
-    """Inference engine for trained models"""
+    """Inference for trained models"""
     
     def __init__(self, model_path, conf_threshold=0.45, iou_threshold=0.45):
         """

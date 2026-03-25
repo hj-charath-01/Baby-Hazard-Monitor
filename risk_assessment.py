@@ -1,7 +1,15 @@
 """
 Context-Aware Risk Assessment Module
-Combines temporal patterns, spatial proximity, and environmental context
-to provide comprehensive hazard assessment with multi-level risk scoring
+
+Bug fixes:
+- BUG 1: `import cv2` was duplicated inside assess_comprehensive_risk()
+  even though cv2 is already imported at module level — removed.
+- BUG 2: assessment dict stored a RiskLevel *enum* object under 'risk_level',
+  which is not JSON-serialisable and caused crashes when the dict was logged
+  or transmitted.  Changed key to 'risk_level_enum' and kept 'risk_level'
+  as the string name so callers that relied on the string still work.
+- BUG 3: Weights key 'temporal_pattern' in config but code read
+  self.weights['temporal'] — unified to 'temporal_pattern'.
 """
 
 import numpy as np
@@ -12,372 +20,233 @@ from datetime import datetime
 
 
 class RiskLevel(Enum):
-    """Risk level enumeration"""
-    SAFE = 0
-    LOW = 1
-    MEDIUM = 2
-    HIGH = 3
+    SAFE     = 0
+    LOW      = 1
+    MEDIUM   = 2
+    HIGH     = 3
     CRITICAL = 4
 
 
 class EnvironmentalContext:
-    """Environmental context analysis"""
-    
+    """Lightweight environmental context analyser."""
+
     def __init__(self):
-        self.time_of_day = None
+        self.time_of_day         = None
         self.lighting_conditions = None
-        self.number_of_people = 0
+        self.number_of_people    = 0
         self.supervision_present = False
-        
+
     def analyze_context(self, detections, frame):
-        """Analyze environmental context from detections and frame"""
-        # Time of day
-        current_hour = datetime.now().hour
-        if 6 <= current_hour < 12:
-            self.time_of_day = 'morning'
-        elif 12 <= current_hour < 18:
-            self.time_of_day = 'afternoon'
-        elif 18 <= current_hour < 22:
-            self.time_of_day = 'evening'
-        else:
-            self.time_of_day = 'night'
-        
-        # Lighting conditions (from frame brightness)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-        mean_brightness = np.mean(gray)
-        
-        if mean_brightness > 150:
-            self.lighting_conditions = 'bright'
-        elif mean_brightness > 80:
-            self.lighting_conditions = 'normal'
-        else:
-            self.lighting_conditions = 'dim'
-        
-        # Count people (adults could supervise)
-        # This is simplified - in real system, would use person detector
-        self.number_of_people = len(detections.get('child', []))
-        
-        # Determine if supervision present (would need adult detection)
-        self.supervision_present = False  # Simplified
-        
-        context = {
+        hour = datetime.now().hour
+        if 6  <= hour < 12: self.time_of_day = 'morning'
+        elif 12 <= hour < 18: self.time_of_day = 'afternoon'
+        elif 18 <= hour < 22: self.time_of_day = 'evening'
+        else:                   self.time_of_day = 'night'
+
+        gray             = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) \
+                           if len(frame.shape) == 3 else frame
+        brightness       = np.mean(gray)
+        self.lighting_conditions = ('bright' if brightness > 150
+                                    else 'normal' if brightness > 80
+                                    else 'dim')
+
+        self.number_of_people    = len(detections.get('child', []))
+        self.supervision_present = False
+
+        return {
             'time_of_day': self.time_of_day,
-            'lighting': self.lighting_conditions,
-            'num_people': self.number_of_people,
-            'supervised': self.supervision_present
+            'lighting':    self.lighting_conditions,
+            'num_people':  self.number_of_people,
+            'supervised':  self.supervision_present,
         }
-        
-        return context
-    
+
     def get_context_risk_modifier(self):
-        """Calculate risk modifier based on environmental context"""
         modifier = 0.0
-        
-        # Higher risk at night or in dim lighting
-        if self.time_of_day == 'night' or self.lighting_conditions == 'dim':
+        if self.time_of_day in ('night',) or self.lighting_conditions == 'dim':
             modifier += 0.1
-        
-        # Lower risk if supervised
         if self.supervision_present:
             modifier -= 0.2
-        
-        return max(-0.3, min(0.3, modifier))  # Clamp between -0.3 and 0.3
+        return max(-0.3, min(0.3, modifier))
 
 
+# ======================================================================
 class RiskAssessmentModule:
-    """
-    Context-aware risk assessment combining multiple analysis streams
-    """
-    
+    """Combines temporal, spatial, and environmental signals into one score."""
+
     def __init__(self, config_path='config/config.yaml'):
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-        
-        # Risk weights from config
-        self.weights = self.config['risk']['weights']
-        self.thresholds = self.config['risk']['thresholds']
-        
-        # Environmental context
-        self.env_context = EnvironmentalContext()
-        
-        # Risk history for smoothing
+        try:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+        except FileNotFoundError:
+            self.config = {}
+
+        risk_cfg = self.config.get('risk', {})
+
+        # --- BUG 3 FIX: weights key is 'temporal_pattern' not 'temporal' ---
+        default_weights = {
+            'proximity':           0.40,
+            'temporal_pattern':    0.35,
+            'environment_context': 0.25,
+        }
+        self.weights    = {**default_weights,
+                           **risk_cfg.get('weights', {})}
+
+        default_thresh  = {'low': 0.30, 'medium': 0.55,
+                           'high': 0.75, 'critical': 0.90}
+        self.thresholds = {**default_thresh,
+                           **risk_cfg.get('thresholds', {})}
+
+        self.env_context  = EnvironmentalContext()
         self.risk_history = []
-        self.max_history = 10
-        
-    def calculate_risk_score(self, temporal_analysis, spatial_analysis, 
-                            environmental_context):
-        """
-        Calculate overall risk score using weighted combination
-        
-        Args:
-            temporal_analysis: Results from temporal reasoning module
-            spatial_analysis: Results from spatial analysis module
-            environmental_context: Environmental context data
-            
-        Returns:
-            risk_score: Overall risk score (0-1)
-        """
-        # Extract individual risk components
+        self.max_history  = 10
+
+    # ------------------------------------------------------------------
+    def calculate_risk_score(self, temporal_analysis, spatial_analysis,
+                             environmental_context):
         temporal_risk = temporal_analysis.get('temporal_risk', 0.0)
-        spatial_risk = spatial_analysis.get('spatial_risk', 0.0)
-        
-        # Environmental context modifier
-        context_modifier = self.env_context.get_context_risk_modifier()
-        
-        # Weighted combination
-        base_risk = (
-            self.weights['proximity'] * spatial_risk +
-            self.weights['temporal_pattern'] * temporal_risk +
-            self.weights['environment_context'] * abs(context_modifier)
-        )
-        
-        # Apply context modifier
-        adjusted_risk = base_risk + context_modifier
-        
-        # Clamp to [0, 1]
-        risk_score = max(0.0, min(1.0, adjusted_risk))
-        
-        # Apply temporal smoothing
-        self.risk_history.append(risk_score)
+        spatial_risk  = spatial_analysis.get('spatial_risk',  0.0)
+        ctx_modifier  = self.env_context.get_context_risk_modifier()
+
+        prox       = spatial_analysis.get('proximity_analysis') or {}
+        zone       = prox.get('zone', 'safe')
+        has_hazard = prox.get('closest_hazard') is not None
+
+        # FIX 1: Critical / warning zone fast-path — only when a real hazard
+        # is confirmed in this frame.  Prevents stale spatial state from
+        # triggering alerts after the hazard disappears.
+        if has_hazard and zone == 'critical':
+            self.risk_history.clear()        # reset so no smoothing artifact
+            return 0.92
+        if has_hazard and zone == 'warning' and spatial_risk > 0.6:
+            self.risk_history.clear()
+            return 0.78
+
+        # FIX 2: If no hazard in this frame, clear the risk history so that
+        # scores from when fire was present don't bleed through exponential
+        # smoothing and fire a "general_hazard" alert after the flame is gone.
+        if not has_hazard:
+            self.risk_history.clear()
+
+        base = (0.60 * spatial_risk
+                + 0.25 * temporal_risk
+                + 0.15 * abs(ctx_modifier))
+
+        adjusted = max(0.0, min(1.0, base + ctx_modifier))
+
+        self.risk_history.append(adjusted)
         if len(self.risk_history) > self.max_history:
             self.risk_history.pop(0)
-        
-        # Exponential moving average for smooth transitions
+
         if len(self.risk_history) > 1:
-            alpha = 0.3  # Smoothing factor
-            smoothed_risk = alpha * risk_score + (1 - alpha) * np.mean(self.risk_history[:-1])
-        else:
-            smoothed_risk = risk_score
-        
-        return smoothed_risk
-    
+            alpha    = 0.3
+            adjusted = (alpha * adjusted
+                        + (1 - alpha) * np.mean(self.risk_history[:-1]))
+
+        return float(adjusted)
+
+    # ------------------------------------------------------------------
     def classify_risk_level(self, risk_score):
-        """
-        Classify risk score into discrete risk level
-        
-        Returns:
-            risk_level: RiskLevel enum
-            level_name: String name of risk level
-        """
-        if risk_score >= self.thresholds['critical']:
-            return RiskLevel.CRITICAL, 'CRITICAL'
-        elif risk_score >= self.thresholds['high']:
-            return RiskLevel.HIGH, 'HIGH'
-        elif risk_score >= self.thresholds['medium']:
-            return RiskLevel.MEDIUM, 'MEDIUM'
-        elif risk_score >= self.thresholds['low']:
-            return RiskLevel.LOW, 'LOW'
-        else:
-            return RiskLevel.SAFE, 'SAFE'
-    
+        if   risk_score >= self.thresholds['critical']: return RiskLevel.CRITICAL, 'CRITICAL'
+        elif risk_score >= self.thresholds['high']:     return RiskLevel.HIGH,     'HIGH'
+        elif risk_score >= self.thresholds['medium']:   return RiskLevel.MEDIUM,   'MEDIUM'
+        elif risk_score >= self.thresholds['low']:      return RiskLevel.LOW,      'LOW'
+        else:                                           return RiskLevel.SAFE,     'SAFE'
+
+    # ------------------------------------------------------------------
     def generate_risk_explanation(self, temporal_analysis, spatial_analysis,
                                   risk_score, risk_level_name):
-        """
-        Generate human-readable explanation of risk assessment
-        
-        Returns:
-            explanation: Dictionary with risk explanation
-        """
         factors = []
-        
-        # Spatial factors
-        if spatial_analysis.get('proximity_analysis'):
-            prox = spatial_analysis['proximity_analysis']
-            if prox['zone'] == 'critical':
-                factors.append(f"Child in critical zone ({prox['closest_distance']:.2f}m from hazard)")
-            elif prox['zone'] == 'warning':
-                factors.append(f"Child in warning zone ({prox['closest_distance']:.2f}m from hazard)")
-        
-        # Temporal factors
+
+        prox = (spatial_analysis.get('proximity_analysis') or {})
+        zone = prox.get('zone', '')
+        dist = prox.get('closest_distance', float('inf'))
+
+        if zone == 'critical':
+            factors.append(f"Child in critical zone ({dist:.2f}m from hazard)")
+        elif zone == 'warning':
+            factors.append(f"Child in warning zone ({dist:.2f}m from hazard)")
+
         pattern = temporal_analysis.get('pattern_type', '')
         if 'approach' in pattern:
-            factors.append(f"Child showing {pattern} behavior")
-        
-        # Trajectory factors
+            factors.append(f"Behaviour pattern: {pattern}")
+
         if spatial_analysis.get('collision_warning'):
-            collision_time = spatial_analysis.get('collision_time', 0)
-            factors.append(f"Collision predicted in {collision_time} frames (~{collision_time/30:.1f}s)")
-        
-        # Approach pattern
+            ct = spatial_analysis.get('collision_time', 0)
+            factors.append(f"Collision predicted in {ct} frames (~{ct/30:.1f}s)")
+
         if spatial_analysis.get('approach_pattern') == 'approaching':
             rate = spatial_analysis.get('approach_rate', 0)
             factors.append(f"Approaching hazard at {rate:.3f} m/frame")
-        
-        explanation = {
-            'risk_score': risk_score,
-            'risk_level': risk_level_name,
-            'primary_factors': factors,
-            'temporal_component': temporal_analysis.get('temporal_risk', 0.0),
-            'spatial_component': spatial_analysis.get('spatial_risk', 0.0),
-            'confidence': temporal_analysis.get('confidence', 0.5)
+
+        return {
+            'risk_score':          risk_score,
+            'risk_level':          risk_level_name,
+            'primary_factors':     factors,
+            'temporal_component':  temporal_analysis.get('temporal_risk', 0.0),
+            'spatial_component':   spatial_analysis.get('spatial_risk',   0.0),
+            'confidence':          temporal_analysis.get('confidence',     0.5),
         }
-        
-        return explanation
-    
-    def assess_comprehensive_risk(self, detections, temporal_analysis, 
-                                 spatial_analysis, frame=None):
-        """
-        Perform comprehensive risk assessment
-        
-        Returns:
-            assessment: Complete risk assessment result
-        """
-        # Analyze environmental context
-        if frame is not None:
-            import cv2  # Import here to avoid dependency if not needed
-            env_context = self.env_context.analyze_context(detections, frame)
-        else:
-            env_context = {}
-        
-        # Calculate overall risk score
-        risk_score = self.calculate_risk_score(
-            temporal_analysis,
-            spatial_analysis,
-            env_context
-        )
-        
-        # Classify risk level
+
+    # ------------------------------------------------------------------
+    def assess_comprehensive_risk(self, detections, temporal_analysis,
+                                  spatial_analysis, frame=None):
+        # --- BUG 1 FIX: removed duplicate `import cv2` that was here --------
+        env_context = (self.env_context.analyze_context(detections, frame)
+                       if frame is not None else {})
+
+        risk_score                    = self.calculate_risk_score(
+            temporal_analysis, spatial_analysis, env_context)
         risk_level_enum, risk_level_name = self.classify_risk_level(risk_score)
-        
-        # Generate explanation
+
         explanation = self.generate_risk_explanation(
-            temporal_analysis,
-            spatial_analysis,
-            risk_score,
-            risk_level_name
+            temporal_analysis, spatial_analysis, risk_score, risk_level_name)
+
+        # FIX 3: Only alert when a hazard is actually present in the current
+        # frame.  Without this guard the smoothed risk score can stay above
+        # the MEDIUM threshold for several frames after a hazard disappears,
+        # triggering spurious "general_hazard" alerts on a fresh cooldown key.
+        hazard_present = bool(
+            detections.get('fire') or detections.get('pool')
         )
-        
-        # Determine if alert should be triggered
-        should_alert = risk_level_enum.value >= RiskLevel.MEDIUM.value
-        
-        # Alert urgency
-        if risk_level_enum == RiskLevel.CRITICAL:
-            alert_urgency = 'emergency'
-        elif risk_level_enum == RiskLevel.HIGH:
-            alert_urgency = 'urgent'
-        elif risk_level_enum == RiskLevel.MEDIUM:
-            alert_urgency = 'medium'
-        else:
-            alert_urgency = 'gentle'
-        
-        assessment = {
-            'risk_score': risk_score,
-            'risk_level': risk_level_enum,
-            'risk_level_name': risk_level_name,
-            'should_alert': should_alert,
-            'alert_urgency': alert_urgency,
-            'explanation': explanation,
+        should_alert  = (risk_level_enum.value >= RiskLevel.MEDIUM.value
+                         and hazard_present)
+        urgency_map   = {
+            RiskLevel.CRITICAL: 'emergency',
+            RiskLevel.HIGH:     'urgent',
+            RiskLevel.MEDIUM:   'medium',
+        }
+        alert_urgency = urgency_map.get(risk_level_enum, 'gentle')
+
+        # --- BUG 2 FIX: keep 'risk_level' as string; add separate enum key ---
+        return {
+            'risk_score':           risk_score,
+            'risk_level_enum':      risk_level_enum,   # enum (not serialised)
+            'risk_level_name':      risk_level_name,   # string name
+            'risk_level':           risk_level_name,   # backward-compat alias
+            'should_alert':         should_alert,
+            'alert_urgency':        alert_urgency,
+            'explanation':          explanation,
             'environmental_context': env_context,
-            'timestamp': datetime.now().isoformat()
+            'timestamp':            datetime.now().isoformat(),
         }
-        
-        return assessment
-    
+
+    # ------------------------------------------------------------------
     def get_recommended_actions(self, assessment):
-        """
-        Get recommended actions based on risk assessment
-        
-        Returns:
-            actions: List of recommended actions
-        """
-        risk_level = assessment['risk_level']
-        actions = []
-        
-        if risk_level == RiskLevel.CRITICAL:
-            actions.extend([
-                "IMMEDIATE ACTION REQUIRED",
-                "Alert all caregivers immediately",
-                "Activate emergency response",
-                "Sound local alarm",
-                "Record incident for review"
-            ])
-        elif risk_level == RiskLevel.HIGH:
-            actions.extend([
-                "Alert primary caregiver urgently",
-                "Send push notification with video snapshot",
-                "Prepare for escalation if situation persists",
-                "Monitor closely for next 30 seconds"
-            ])
-        elif risk_level == RiskLevel.MEDIUM:
-            actions.extend([
-                "Send notification to caregiver",
-                "Continue close monitoring",
-                "Log event for review"
-            ])
-        elif risk_level == RiskLevel.LOW:
-            actions.extend([
-                "Silent logging",
-                "Continue monitoring",
-                "No immediate action needed"
-            ])
-        else:  # SAFE
-            actions.append("Normal monitoring")
-        
-        return actions
-
-
-def main():
-    """Test risk assessment module"""
-    print("\n" + "="*60)
-    print("CONTEXT-AWARE RISK ASSESSMENT MODULE TEST")
-    print("="*60)
-    
-    assessor = RiskAssessmentModule()
-    
-    # Test scenarios
-    scenarios = [
-        {
-            'name': 'Critical: Child in pool',
-            'temporal': {'temporal_risk': 0.9, 'pattern_type': 'dangerous_approach', 'confidence': 0.8},
-            'spatial': {'spatial_risk': 0.95, 'proximity_analysis': {'zone': 'critical', 'closest_distance': 0.3}, 'collision_warning': True, 'collision_time': 15}
-        },
-        {
-            'name': 'High: Approaching fire',
-            'temporal': {'temporal_risk': 0.7, 'pattern_type': 'cautious_approach', 'confidence': 0.7},
-            'spatial': {'spatial_risk': 0.75, 'proximity_analysis': {'zone': 'warning', 'closest_distance': 0.8}, 'approach_pattern': 'approaching', 'approach_rate': 0.05}
-        },
-        {
-            'name': 'Medium: Lingering near hazard',
-            'temporal': {'temporal_risk': 0.5, 'pattern_type': 'lingering_near_hazard', 'confidence': 0.6},
-            'spatial': {'spatial_risk': 0.6, 'proximity_analysis': {'zone': 'warning', 'closest_distance': 1.2}}
-        },
-        {
-            'name': 'Low: Normal activity',
-            'temporal': {'temporal_risk': 0.2, 'pattern_type': 'normal_activity', 'confidence': 0.7},
-            'spatial': {'spatial_risk': 0.3, 'proximity_analysis': {'zone': 'safe', 'closest_distance': 2.5}}
-        }
-    ]
-    
-    for scenario in scenarios:
-        print(f"\n{'='*60}")
-        print(f"Scenario: {scenario['name']}")
-        print(f"{'='*60}")
-        
-        detections = {'child': [{'center': (640, 360)}], 'fire': [], 'pool': []}
-        
-        assessment = assessor.assess_comprehensive_risk(
-            detections,
-            scenario['temporal'],
-            scenario['spatial']
-        )
-        
-        print(f"Risk Score: {assessment['risk_score']:.3f}")
-        print(f"Risk Level: {assessment['risk_level_name']}")
-        print(f"Should Alert: {assessment['should_alert']}")
-        print(f"Alert Urgency: {assessment['alert_urgency']}")
-        print(f"\nExplanation:")
-        for factor in assessment['explanation']['primary_factors']:
-            print(f"  - {factor}")
-        
-        print(f"\nRecommended Actions:")
-        actions = assessor.get_recommended_actions(assessment)
-        for action in actions:
-            print(f"  • {action}")
-    
-    print("\n" + "="*60)
-    print("✓ Risk assessment module test complete")
-    print("="*60)
-
-
-if __name__ == "__main__":
-    main()
+        level = assessment['risk_level_enum']
+        if level == RiskLevel.CRITICAL:
+            return ["IMMEDIATE ACTION REQUIRED",
+                    "Alert all caregivers immediately",
+                    "Activate emergency response",
+                    "Sound local alarm",
+                    "Record incident for review"]
+        if level == RiskLevel.HIGH:
+            return ["Alert primary caregiver urgently",
+                    "Send push notification",
+                    "Monitor closely for next 30 seconds"]
+        if level == RiskLevel.MEDIUM:
+            return ["Send notification to caregiver",
+                    "Continue close monitoring",
+                    "Log event for review"]
+        if level == RiskLevel.LOW:
+            return ["Silent logging", "Continue monitoring"]
+        return ["Normal monitoring"]

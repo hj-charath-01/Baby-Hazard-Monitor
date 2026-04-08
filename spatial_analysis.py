@@ -2,13 +2,11 @@
 Spatial Analysis Module
 
 FIXED BUGS:
-- Added .get() guards for 'spatial' config key (was crashing when key absent)
-- Fixed velocity history being shared across instances (now per-object via ID)
-- Fixed division-by-zero in classify_proximity_zone when zone boundaries equal
-- FIXED: pixel_to_meter_ratio was 100 (too high — made child+fire always appear
-  far apart). Default is now 40 (40px ≈ 1m, calibrated for typical home camera
-  at ~2–3 m mounting height).  Proximity zone radii also widened so alerts
-  fire before the child is literally touching the hazard.
+- Added .get() guards for 'spatial' config key
+- Fixed velocity history shared across instances
+- Fixed division-by-zero in classify_proximity_zone
+- pixel_to_meter_ratio default 40 (40 px ≈ 1 m)
+- Pool detection removed throughout
 """
 
 import numpy as np
@@ -27,26 +25,20 @@ class SpatialAnalyzer:
 
         spatial_cfg = self.config.get('spatial', {})
 
-        # Zone thresholds in **metres** (edge-to-edge distance).
-        # Widened so alerts trigger before physical contact.
         zones_cfg = spatial_cfg.get('proximity_zones', {})
         self.zones = {
-            'critical': zones_cfg.get('critical', 1.0),   # was 0.5
-            'warning':  zones_cfg.get('warning',  2.5),   # was 1.5
-            'safe':     zones_cfg.get('safe',     5.0),   # was 3.0
+            'critical': zones_cfg.get('critical', 1.0),
+            'warning':  zones_cfg.get('warning',  2.5),
+            'safe':     zones_cfg.get('safe',     5.0),
         }
 
         traj_cfg = spatial_cfg.get('trajectory', {})
         self.prediction_frames  = traj_cfg.get('prediction_frames',  30)
         self.velocity_threshold = traj_cfg.get('velocity_threshold', 0.02)
 
-        # 40 px ≈ 1 m for a typical home camera; override in config/YAML.
-        self.pixel_to_meter_ratio = spatial_cfg.get(
-            'pixel_to_meter_ratio', 40)  # was hardcoded 100
+        self.pixel_to_meter_ratio = spatial_cfg.get('pixel_to_meter_ratio', 40)
 
         self.position_history: deque = deque(maxlen=10)
-
-    # ------------------------------------------------------------------
 
     def calculate_distance(self, point1, point2):
         d_px = float(np.linalg.norm(np.array(point1) - np.array(point2)))
@@ -54,7 +46,6 @@ class SpatialAnalyzer:
         return d_px, d_m
 
     def bbox_edge_distance(self, bbox1, bbox2):
-        """Minimum pixel gap between the edges of two bounding boxes (0 if touching/overlapping)."""
         ax1, ay1, ax2, ay2 = bbox1
         bx1, by1, bx2, by2 = bbox2
         dx = max(0, max(ax1, bx1) - min(ax2, bx2))
@@ -112,11 +103,11 @@ class SpatialAnalyzer:
 
             zone, zone_score = self.classify_proximity_zone(d_m)
             distances.append({
-                'hazard':           hazard,
-                'distance_pixels':  d_px,
-                'distance_meters':  d_m,
-                'zone':             zone,
-                'zone_score':       zone_score,
+                'hazard':          hazard,
+                'distance_pixels': d_px,
+                'distance_meters': d_m,
+                'zone':            zone,
+                'zone_score':      zone_score,
             })
 
         closest = min(distances, key=lambda x: x['distance_meters'])
@@ -212,19 +203,20 @@ class SpatialRiskAssessment:
 
     def assess_risk(self, detections):
         child_dets  = detections.get('child', [])
-        all_hazards = detections.get('fire', []) + detections.get('pool', [])
+        # Only fire hazards remain
+        all_hazards = detections.get('fire', [])
 
         if not child_dets or not all_hazards:
             return {
-                'spatial_risk':        0.0,
-                'proximity_analysis':  None,
-                'trajectory':          None,
-                'collision_warning':   False,
-                'collision_time':      None,
-                'approach_pattern':    'unknown',
-                'approach_rate':       0.0,
-                'velocity':            (0, 0),
-                'speed':               0.0,
+                'spatial_risk':       0.0,
+                'proximity_analysis': None,
+                'trajectory':         None,
+                'collision_warning':  False,
+                'collision_time':     None,
+                'approach_pattern':   'unknown',
+                'approach_rate':      0.0,
+                'velocity':           (0, 0),
+                'speed':              0.0,
             }
 
         proximity = self.spatial_analyzer.analyze_child_hazard_proximity(
@@ -256,7 +248,6 @@ class SpatialRiskAssessment:
         if collision_time is not None and collision_time < 30:
             spatial_risk = min(1.0, spatial_risk + 0.3)
 
-        # Velocity-predictive zone expansion
         LOOKAHEAD = 4
         vx, vy = velocity
         if (abs(vx) > 1 or abs(vy) > 1) and proximity.get('child_bbox'):
@@ -271,8 +262,7 @@ class SpatialRiskAssessment:
             if closest_haz and closest_haz.get('bbox'):
                 _, pred_dm = self.spatial_analyzer.bbox_edge_distance(
                     pred_bbox, closest_haz['bbox'])
-                _, pred_zone_score = self.spatial_analyzer.classify_proximity_zone(
-                    pred_dm)
+                _, pred_zone_score = self.spatial_analyzer.classify_proximity_zone(pred_dm)
                 if pred_zone_score > spatial_risk:
                     spatial_risk = min(1.0, pred_zone_score)
 

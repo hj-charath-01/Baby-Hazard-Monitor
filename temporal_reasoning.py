@@ -14,8 +14,6 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
-# LSTM-Attention network 
-
 if TORCH_AVAILABLE:
     class _LSTMAttentionNet(nn.Module):
         def __init__(self, input_dim, hidden_size, num_heads):
@@ -45,10 +43,8 @@ if TORCH_AVAILABLE:
 
 
 class TemporalReasoningModule:
-    """
-    Wraps the LSTM-Attention network.
-    """
-    INPUT_DIM = 7   # [child, fire, pool, cx, cy, vel, proximity]
+    # Features: [child, fire, cx, cy, vel, proximity]  (pool removed → 6 dims)
+    INPUT_DIM = 6
 
     def __init__(self, config_path='config/config.yaml'):
         with open(config_path, 'r') as f:
@@ -68,24 +64,22 @@ class TemporalReasoningModule:
         else:
             self.net = None
 
-
     def extract_features(self, detections):
         feat = np.zeros(self.INPUT_DIM, dtype=np.float32)
 
         feat[0] = 1.0 if detections.get('child') else 0.0
         feat[1] = 1.0 if detections.get('fire')  else 0.0
-        feat[2] = 1.0 if detections.get('pool')  else 0.0
 
         children = detections.get('child', [])
         if children:
             cx, cy = children[0]['center']
-            feat[3] = cx / 1280.0
-            feat[4] = cy / 720.0
+            feat[2] = cx / 1280.0
+            feat[3] = cy / 720.0
             if self.frame_buffer and self.frame_buffer[-1][0] == 1.0:
-                feat[5] = float(np.hypot(feat[3] - self.frame_buffer[-1][3],
-                                         feat[4] - self.frame_buffer[-1][4]))
+                feat[4] = float(np.hypot(feat[2] - self.frame_buffer[-1][2],
+                                         feat[3] - self.frame_buffer[-1][3]))
 
-        feat[6] = self._proximity_score(detections)
+        feat[5] = self._proximity_score(detections)
         return feat
 
     def _proximity_score(self, detections):
@@ -94,10 +88,9 @@ class TemporalReasoningModule:
         child_c = np.array(detections['child'][0]['center'])
         diag    = np.hypot(1280, 720)
         best    = 0.0
-        for h_type in ('fire', 'pool'):
-            for h in detections.get(h_type, []):
-                d = np.linalg.norm(child_c - np.array(h['center']))
-                best = max(best, 1.0 - d / diag)
+        for h in detections.get('fire', []):
+            d = np.linalg.norm(child_c - np.array(h['center']))
+            best = max(best, 1.0 - d / diag)
         return float(best)
 
     def update_buffer(self, features):
@@ -109,7 +102,6 @@ class TemporalReasoningModule:
 
         import torch
         with torch.no_grad():
-            # FIX: detach hidden state to avoid BPTT graph accumulation
             if self.hidden is not None:
                 self.hidden = tuple(h.detach() for h in self.hidden)
             score, attn_w, self.hidden = self.net(sequence_tensor, self.hidden)
@@ -128,21 +120,19 @@ class TemporalReasoningModule:
             seq    = torch.FloatTensor(np.array(self.frame_buffer)).unsqueeze(0)
             risk,_ = self.forward(seq)
         else:
-            # Heuristic fallback
             seq  = np.array(self.frame_buffer)
-            risk = float(np.mean(seq[:, 6]) * (1 + float(np.mean(seq[:, 5])) * 5))
+            risk = float(np.mean(seq[:, 5]) * (1 + float(np.mean(seq[:, 4])) * 5))
             risk = min(1.0, risk)
 
         pattern = self._classify_pattern(np.array(self.frame_buffer), risk)
         return risk, pattern
 
     def _classify_pattern(self, sequence, risk_score):
-        # FIX: guard against short sequences
         n = len(sequence)
         if n < 5:
             return "insufficient_data"
 
-        prox = sequence[:, 6]
+        prox = sequence[:, 5]
         half = max(1, n // 2)
 
         if np.mean(prox[-half:]) > np.mean(prox[:half]):
@@ -151,7 +141,7 @@ class TemporalReasoningModule:
         if np.mean(prox) > 0.6 and np.std(prox) < 0.1:
             return "lingering_near_hazard"
 
-        if n >= 10 and np.mean(sequence[-10:, 5]) > 0.05:
+        if n >= 10 and np.mean(sequence[-10:, 4]) > 0.05:
             return "rapid_movement"
 
         child_frames = sequence[-min(10, n):, 0]
@@ -168,7 +158,7 @@ class TemporalReasoningModule:
         if len(self.frame_buffer) < 5:
             return None
         recent = np.array(self.frame_buffer)[-5:]
-        positions = recent[:, 3:5]
+        positions = recent[:, 2:4]
         if len(positions) >= 2:
             vel = positions[-1] - positions[-2]
             preds, cur = [], positions[-1].copy()
@@ -177,8 +167,6 @@ class TemporalReasoningModule:
                 preds.append(cur.copy())
             return np.array(preds)
         return None
-
-
 
 
 class TemporalPatternAnalyzer:
@@ -196,7 +184,8 @@ class TemporalPatternAnalyzer:
         self.pattern_history.append({'risk': temporal_risk, 'pattern': pattern_type})
 
         is_hazardous = (
-            temporal_risk > self.temporal_threshold and pattern_type in ('dangerous_approach', 'lingering_near_hazard')
+            temporal_risk > self.temporal_threshold
+            and pattern_type in ('dangerous_approach', 'lingering_near_hazard')
         )
 
         return {
@@ -211,8 +200,8 @@ class TemporalPatternAnalyzer:
         if len(self.pattern_history) < 10:
             return 0.5
         from collections import Counter
-        recent   = [p['pattern'] for p in list(self.pattern_history)[-10:]]
-        top_cnt  = Counter(recent).most_common(1)[0][1]
+        recent  = [p['pattern'] for p in list(self.pattern_history)[-10:]]
+        top_cnt = Counter(recent).most_common(1)[0][1]
         return top_cnt / 10.0
 
     def reset(self):

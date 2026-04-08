@@ -1,34 +1,6 @@
 """
 Live Video Detection — Baby Hazard Monitoring
-==========================================
-Standalone script for real-time hazard detection from webcam or video file.
-
-Usage
------
-  python live_detection.py                          # webcam
-  python live_detection.py --camera 1               # second camera
-  python live_detection.py --video path/to/file.mp4 # video file
-  python live_detection.py --video in.mp4 --output out.mp4
-
-Keyboard controls
------------------
-  q  — quit
-  p  — pause / resume
-  s  — save screenshot
-  r  — reset temporal / spatial history
-  +  — raise confidence threshold by 0.05
-  -  — lower confidence threshold by 0.05
-
-FIXES
------
-- Demo child + fire positions updated so they move toward each other,
-  triggering genuine CRITICAL/HIGH alerts.
-- HUD completely redesigned: clean dark panel, coloured risk bar, crisp
-  typography, no Unicode symbols that break OpenCV on some builds.
-- draw_proximity_zones draws child-centred expanding rectangles instead of
-  fixed circles; critical ring pulses red.
-- Suppressed noisy per-frame print output; status printed every 60 frames.
-- pixel_to_meter_ratio aligned with spatial_analysis.py (40 px/m).
+Pool detection removed. Only child + fire.
 """
 
 import argparse
@@ -43,7 +15,6 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# ---------------------------------------------------------------------------
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
@@ -92,15 +63,13 @@ except Exception as e:
 
 
 # ===========================================================================
-# Colour palette  (BGR)
+# Colour palette (BGR)
 # ===========================================================================
 _C = {
-    'child':    (50,  220,  50),
-    'fire':     (30,  80,  255),
-    'pool':     (220, 100,   0),
-    'smoke':    (170, 170, 170),
-    'water':    (200, 160,   0),
-    'default':  (200, 200, 200),
+    'child':   (50,  220,  50),
+    'fire':    (30,   80, 255),
+    'smoke':   (170, 170, 170),
+    'default': (200, 200, 200),
 }
 
 _RISK_BGR = {
@@ -111,7 +80,7 @@ _RISK_BGR = {
     'CRITICAL': (20,   20, 255),
 }
 
-_RISK_ACCENT = {          # brighter version for text
+_RISK_ACCENT = {
     'SAFE':     (100, 255, 100),
     'LOW':      (100, 255, 255),
     'MEDIUM':   (80,  200, 255),
@@ -129,17 +98,16 @@ FONT_MONO = cv2.FONT_HERSHEY_DUPLEX
 class HazardDetector:
     CHILD_CLASSES = {'child', 'person', 'baby', 'toddler'}
     FIRE_CLASSES  = {'fire', 'flame', 'smoke'}
-    POOL_CLASSES  = {'pool', 'water', 'drowning', 'swimming'}
 
-    INFER_WIDTH  = 416
-    HAZARD_CONF  = 0.65
+    INFER_WIDTH = 416
+    HAZARD_CONF = 0.65
 
     def __init__(self, model_dir='models', conf=0.45, iou=0.45):
-        self.conf       = conf
-        self.iou        = iou
-        self.models     = {}
-        self._demo_t    = 0
-        self._use_demo  = False
+        self.conf      = conf
+        self.iou       = iou
+        self.models    = {}
+        self._demo_t   = 0
+        self._use_demo = False
 
         if YOLO_AVAILABLE:
             self._load_models(Path(model_dir))
@@ -150,7 +118,6 @@ class HazardDetector:
         candidates = {
             'child': ['child_detector.pt', 'child.pt'],
             'fire':  ['fire_detector.pt',  'fire.pt'],
-            'pool':  ['pool_detector.pt',  'pool.pt'],
         }
         loaded = False
         for task, names in candidates.items():
@@ -174,26 +141,22 @@ class HazardDetector:
             self._use_demo = True
 
     def detect(self, frame):
-        """Returns (detections_dict, frame).
-        In demo mode the frame is replaced with a synthetic background."""
         if self._use_demo:
-            result = self._demo_detections(frame)   # modifies frame in-place
+            result = self._demo_detections(frame)
             return result, frame
         result = self._detect_real(frame)
         return result, frame
 
     def _detect_real(self, frame):
-        result = {'child': [], 'fire': [], 'pool': []}
+        result = {'child': [], 'fire': []}
         h, w   = frame.shape[:2]
         scale  = self.INFER_WIDTH / w
         ih     = int(h * scale)
         small  = cv2.resize(frame, (self.INFER_WIDTH, ih),
                             interpolation=cv2.INTER_LINEAR)
 
-        BUCKETS = {'child': 'child', 'fire': 'fire', 'pool': 'pool', 'general': None}
-        ALLOWED = {'child': self.CHILD_CLASSES,
-                   'fire':  self.FIRE_CLASSES,
-                   'pool':  self.POOL_CLASSES}
+        BUCKETS  = {'child': 'child', 'fire': 'fire', 'general': None}
+        ALLOWED  = {'child': self.CHILD_CLASSES, 'fire': self.FIRE_CLASSES}
 
         for task, model in self.models.items():
             bucket   = BUCKETS.get(task)
@@ -201,7 +164,7 @@ class HazardDetector:
             try:
                 preds = model.predict(small, conf=min_conf, iou=self.iou,
                                       verbose=False)[0]
-            except Exception as e:
+            except Exception:
                 continue
             if preds.boxes is None:
                 continue
@@ -217,97 +180,63 @@ class HazardDetector:
                 y1 = max(0,     int(box[1] / scale))
                 x2 = min(w - 1, int(box[2] / scale))
                 y2 = min(h - 1, int(box[3] / scale))
-                det = dict(bbox=[x1,y1,x2,y2], confidence=float(conf),
+                det = dict(bbox=[x1, y1, x2, y2], confidence=float(conf),
                            class_name=cn, class_id=int(cls_id),
-                           center=((x1+x2)//2,(y1+y2)//2),
+                           center=((x1+x2)//2, (y1+y2)//2),
                            area=(x2-x1)*(y2-y1))
                 if bucket:
                     if cn in ALLOWED.get(bucket, set()):
                         result[bucket].append(det)
                 else:
-                    if cn in self.CHILD_CLASSES:  result['child'].append(det)
-                    elif cn in self.FIRE_CLASSES:  result['fire'].append(det)
-                    elif cn in self.POOL_CLASSES:  result['pool'].append(det)
+                    if cn in self.CHILD_CLASSES: result['child'].append(det)
+                    elif cn in self.FIRE_CLASSES: result['fire'].append(det)
 
-        # Person-misclassification filter — only removes hazard boxes that
-        # substantially OVERLAP a person bbox (IoU > 0.35).  The previous
-        # 50 px gap / center-inside checks were too aggressive: they removed
-        # real fire detections the moment a child was anywhere nearby, which
-        # is exactly when alerts matter most.
         def _iou(a, b):
-            ix1,iy1 = max(a[0],b[0]),max(a[1],b[1])
-            ix2,iy2 = min(a[2],b[2]),min(a[3],b[3])
-            inter = max(0,ix2-ix1)*max(0,iy2-iy1)
+            ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+            ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+            inter = max(0, ix2-ix1) * max(0, iy2-iy1)
             if not inter: return 0.0
-            u = (a[2]-a[0])*(a[3]-a[1])+(b[2]-b[0])*(b[3]-b[1])-inter
+            u = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
             return inter/u if u else 0.0
-        def _person_fp(hbbox, persons):
-            for p in persons:
-                if _iou(hbbox, p['bbox']) > 0.35:
-                    return True
-            return False
-        for key in ('fire','pool'):
-            result[key] = [h for h in result[key]
-                           if not _person_fp(h['bbox'], result['child'])]
+
+        result['fire'] = [h for h in result['fire']
+                          if not any(_iou(h['bbox'], p['bbox']) > 0.35
+                                     for p in result['child'])]
         return result
 
-    # ------------------------------------------------------------------
     def _make_demo_frame(self, w, h, t):
-        """
-        Synthetic camera background for demo mode.
-        Dark scene with a subtle grid, scanline overlay, and a dim
-        'room' gradient — so the window always shows something useful
-        even when no physical camera is attached.
-        """
         frame = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # Soft room-tone gradient (warm dark grey, brighter at centre)
         cx, cy = w // 2, h // 2
         Y, X   = np.ogrid[:h, :w]
         dist   = np.sqrt((X - cx)**2 + (Y - cy)**2).astype(np.float32)
         dist  /= max(dist.max(), 1)
         glow   = (1.0 - dist) * 38
-        frame[:, :, 0] = glow.astype(np.uint8)        # B
-        frame[:, :, 1] = (glow * 0.88).astype(np.uint8)  # G
-        frame[:, :, 2] = (glow * 0.72).astype(np.uint8)  # R  → warm tint
-
-        # Grid lines
+        frame[:, :, 0] = glow.astype(np.uint8)
+        frame[:, :, 1] = (glow * 0.88).astype(np.uint8)
+        frame[:, :, 2] = (glow * 0.72).astype(np.uint8)
         grid = 60
         for x in range(0, w, grid):
             cv2.line(frame, (x, 0), (x, h), (22, 24, 28), 1)
         for y in range(0, h, grid):
             cv2.line(frame, (0, y), (w, y), (22, 24, 28), 1)
-
-        # Scanline texture (every other row dimmed slightly)
         frame[::2, :] = (frame[::2, :] * 0.88).astype(np.uint8)
-
-        # "DEMO" watermark
         cv2.putText(frame, "DEMO MODE", (10, h - 14),
                     FONT, 0.42, (55, 62, 80), 1, cv2.LINE_AA)
-
         return frame
 
     def _demo_detections(self, frame):
-        """
-        Generate synthetic detections AND replace the frame with a
-        synthetic background so the window is never blank/black.
-        Child sweeps across; fire is stationary near the centre.
-        """
         self._demo_t += 1
         h, w = frame.shape[:2]
         t    = self._demo_t
 
-        # Replace frame with synthetic background
         bg = self._make_demo_frame(w, h, t)
         frame[:] = bg[:]
 
-        result = {'child': [], 'fire': [], 'pool': []}
+        result = {'child': [], 'fire': []}
 
-        # Fire fixed at ~55 % from left
         fx, fy = int(w * 0.55), int(h * 0.45)
         fw, fh = 70, 90
 
-        # Child sweeps across, passing through fire (~8 s period at 30 fps)
         phase = (t % 240) / 240.0
         cx    = int(w * 0.10 + w * 0.80 * phase)
         cy    = int(h * 0.42 + h * 0.06 * np.sin(t * 0.08))
@@ -321,13 +250,13 @@ class HazardDetector:
         result['child'].append(dict(
             bbox=[cx1, cy1, cx2, cy2],
             confidence=0.93, class_name='child', class_id=0,
-            center=(cx, cy), area=(cx2 - cx1) * (cy2 - cy1)))
+            center=(cx, cy), area=(cx2-cx1)*(cy2-cy1)))
 
         if t % 240 > 15:
             result['fire'].append(dict(
-                bbox=[fx - fw // 2, fy - fh // 2, fx + fw // 2, fy + fh // 2],
+                bbox=[fx-fw//2, fy-fh//2, fx+fw//2, fy+fh//2],
                 confidence=0.88, class_name='fire', class_id=1,
-                center=(fx, fy), area=fw * fh))
+                center=(fx, fy), area=fw*fh))
 
         return result
 
@@ -342,7 +271,7 @@ def draw_detections(frame, detections):
         colour = _C.get(key, _C['default'])
         for d in dets:
             x1, y1, x2, y2 = d['bbox']
-            cv2.rectangle(vis, (x1,y1), (x2,y2), colour, 2)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 2)
             label = f"{d['class_name'].upper()}  {d['confidence']:.0%}"
             (lw, lh), _ = cv2.getTextSize(label, FONT, 0.48, 1)
             cv2.rectangle(vis, (x1, y1-lh-10), (x1+lw+8, y1), colour, -1)
@@ -353,43 +282,37 @@ def draw_detections(frame, detections):
 
 def draw_proximity_zones(frame, hazard_center, child_bbox=None,
                          pixel_per_metre=40, pulse=0):
-    """
-    FIX: Draw expanding child-centred rectangles showing proximity zones.
-    Critical ring animates (pulsing red) when child is dangerously close.
-    Falls back to circles around the hazard when no child bbox available.
-    """
     vis = frame.copy()
     h, w = vis.shape[:2]
 
     zones = [
-        (5.0, (0,160,0),   'SAFE'),
-        (2.5, (0,140,255), 'WARN'),
-        (1.0, (0,0,230),   'CRIT'),
+        (5.0, (0, 160,   0), 'SAFE'),
+        (2.5, (0, 140, 255), 'WARN'),
+        (1.0, (0,   0, 230), 'CRIT'),
     ]
 
     if child_bbox is not None:
         cx1, cy1, cx2, cy2 = child_bbox
         for metres, colour, label in zones:
             pad = int(metres * pixel_per_metre)
-            rx1 = max(0,     cx1 - pad)
-            ry1 = max(0,     cy1 - pad)
-            rx2 = min(w-1,   cx2 + pad)
-            ry2 = min(h-1,   cy2 + pad)
+            rx1 = max(0,   cx1 - pad)
+            ry1 = max(0,   cy1 - pad)
+            rx2 = min(w-1, cx2 + pad)
+            ry2 = min(h-1, cy2 + pad)
             if label == 'CRIT':
-                # Pulse: brighten colour with sin wave
                 p = int(abs(np.sin(pulse * 0.15)) * 80)
-                colour = (min(255,colour[0]+p), colour[1], min(255,colour[2]+p))
+                colour = (min(255, colour[0]+p), colour[1], min(255, colour[2]+p))
                 thickness = 3
             else:
                 thickness = 1
-            cv2.rectangle(vis, (rx1,ry1), (rx2,ry2), colour, thickness, cv2.LINE_AA)
+            cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), colour, thickness, cv2.LINE_AA)
             cv2.putText(vis, label, (rx1+4, ry1+14),
                         FONT, 0.38, colour, 1, cv2.LINE_AA)
     else:
         cx, cy = int(hazard_center[0]), int(hazard_center[1])
         for metres, colour, label in zones:
             r = int(metres * pixel_per_metre)
-            cv2.circle(vis, (cx,cy), r, colour, 1, cv2.LINE_AA)
+            cv2.circle(vis, (cx, cy), r, colour, 1, cv2.LINE_AA)
     return vis
 
 
@@ -398,8 +321,8 @@ def draw_trajectory(frame, trajectory, frame_w, frame_h):
         return frame
     vis = frame.copy()
     pts = np.column_stack([
-        np.clip(trajectory[:,0]*frame_w, 0, frame_w-1).astype(int),
-        np.clip(trajectory[:,1]*frame_h, 0, frame_h-1).astype(int),
+        np.clip(trajectory[:, 0]*frame_w, 0, frame_w-1).astype(int),
+        np.clip(trajectory[:, 1]*frame_h, 0, frame_h-1).astype(int),
     ])
     n = len(pts)
     for i in range(n-1):
@@ -413,65 +336,38 @@ def draw_trajectory(frame, trajectory, frame_w, frame_h):
 def draw_hud(frame, risk_level, risk_score, pattern, fps,
              conf_thresh, paused, frame_count, proximity_info,
              alert_count=0, pulse=0, map_state=None):
-    """
-    Polished HUD drawn as a right-side panel.
-
-    ROOT-CAUSE FIX for the "black strip / black frame" bug:
-      The previous version called
-          cv2.addWeighted(overlay, 0.82, vis, 0.18, 0, vis)
-      which (a) blended the dark rectangle over the ENTIRE frame (making the
-      left / video half dark on many OpenCV builds) and (b) used `vis` as
-      both src2 and dst, which is undefined behaviour in OpenCV.
-
-      The fix:
-        1. Panel width is adaptive: min(300, w // 3) so it never swallows
-           the entire frame at low resolutions.
-        2. Blending touches ONLY the panel ROI — the rest of the frame is
-           never read from or written to by addWeighted.
-        3. src2 and dst are always different arrays.
-    """
     vis  = frame.copy()
     h, w = vis.shape[:2]
 
-    # --- Adaptive panel width: at most 300 px, at most 1/3 of frame width ---
     pw = min(300, max(200, w // 3))
-    px = w - pw          # left edge of panel
+    px = w - pw
 
-    rc = _RISK_BGR.get(risk_level,   (160, 160, 160))
-    ra = _RISK_ACCENT.get(risk_level,(220, 220, 220))
+    rc = _RISK_BGR.get(risk_level,    (160, 160, 160))
+    ra = _RISK_ACCENT.get(risk_level, (220, 220, 220))
 
-    # ------------------------------------------------------------------ #
-    # Blend ONLY the panel ROI — never touch the video region             #
-    # ------------------------------------------------------------------ #
-    panel_roi   = vis[0:h, px:w]               # view into vis (video region untouched)
+    panel_roi   = vis[0:h, px:w]
     dark_panel  = np.full_like(panel_roi, (14, 16, 20))
     blended_roi = cv2.addWeighted(dark_panel, 0.82, panel_roi, 0.18, 0)
-    vis[0:h, px:w] = blended_roi               # write back only the panel area
+    vis[0:h, px:w] = blended_roi
 
-    # Thin separator line
     cv2.line(vis, (px, 0), (px, h), (50, 55, 65), 1)
 
-    yw = pw - 20    # usable width inside panel
+    yw = pw - 20
     y  = 18
 
-    # Helper: draw text relative to panel origin
     def txt(s, yp, scale=0.44, col=(200, 205, 215), bold=False):
         cv2.putText(vis, s, (px + 10, yp),
                     FONT, scale, col, 2 if bold else 1, cv2.LINE_AA)
 
     def sep(yp, label=None):
-        """Draw a horizontal rule with optional small label above it.
-        Returns y-position ready for the first content line below."""
-        lh = 12   # label font height in px
-        gap = 6   # gap between label bottom and rule
+        lh, gap = 12, 6
         rule_y = yp + (lh + gap if label else 0)
         if label:
             cv2.putText(vis, label, (px + 10, yp + lh),
                         FONT, 0.32, (75, 88, 112), 1, cv2.LINE_AA)
         cv2.line(vis, (px + 6, rule_y), (px + pw - 6, rule_y), (38, 44, 56), 1)
-        return rule_y + 14   # 14 px clear space below rule for first content
+        return rule_y + 14
 
-    # ---- Title ----
     cv2.putText(vis, "GUARD", (px + 10, y + 22),
                 FONT_MONO, 0.78, (235, 240, 255), 2, cv2.LINE_AA)
     cv2.putText(vis, "AI", (px + 10 + 72, y + 22),
@@ -480,7 +376,6 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
                 FONT, 0.32, (70, 82, 105), 1, cv2.LINE_AA)
     y += 52
 
-    # ---- Risk bar ----
     bar_h  = 14
     filled = int(yw * max(0.0, min(1.0, risk_score)))
     cv2.rectangle(vis, (px + 10, y), (px + 10 + yw, y + bar_h), (30, 34, 44), -1)
@@ -495,7 +390,6 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
                 FONT, 0.48, (130, 138, 155), 1, cv2.LINE_AA)
     y += 26
 
-    # ---- Proximity ----
     y = sep(y + 6, "PROXIMITY")
     if proximity_info:
         dist = proximity_info.get('closest_distance', float('inf'))
@@ -509,12 +403,10 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
         txt("No hazard in frame", y, col=(72, 82, 105))
     y += 20
 
-    # ---- Behaviour ----
     y = sep(y + 6, "BEHAVIOUR")
     txt(pattern.replace('_', ' ').title()[:22], y, col=(170, 178, 198))
     y += 20
 
-    # ---- System stats ----
     y = sep(y + 6, "SYSTEM")
     txt(f"FPS    {fps:5.1f}",        y); y += 17
     txt(f"Conf   {conf_thresh:.2f}", y); y += 17
@@ -523,36 +415,31 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
     txt(f"Alerts {alert_count}", y, col=ac)
     y += 22
 
-    # ---- Alert banner (only when HIGH/CRITICAL) ----
     if risk_level in ('CRITICAL', 'HIGH'):
         blink = int(abs(np.sin(pulse * 0.18)) * 200)
         fill  = (0, 0, max(0, blink - 40))
-        cv2.rectangle(vis, (px + 6, y),     (px + pw - 6, y + 32), fill, -1)
-        cv2.rectangle(vis, (px + 6, y),     (px + pw - 6, y + 32), rc, 1)
+        cv2.rectangle(vis, (px + 6, y), (px + pw - 6, y + 32), fill, -1)
+        cv2.rectangle(vis, (px + 6, y), (px + pw - 6, y + 32), rc, 1)
         msg = "!! CRITICAL ALERT" if risk_level == 'CRITICAL' else "!! HIGH RISK"
         cv2.putText(vis, msg, (px + 12, y + 21),
                     FONT_MONO, 0.46, ra, 2, cv2.LINE_AA)
         y += 40
 
-    # ---- PAUSED ----
     if paused:
         cv2.putText(vis, "[ PAUSED ]", (px + 10, h - 44),
                     FONT_MONO, 0.56, (0, 210, 255), 2, cv2.LINE_AA)
 
-    # ---- Room map status — anchored above the key legend ----
-    legend_h = 5 * 14 + 16   # 5 keys × 14px + padding
-    map_y    = h - legend_h - 36   # fixed slot above legends
+    legend_h = 5 * 14 + 16
+    map_y    = h - legend_h - 36
 
-    if map_state and map_y > y:   # only draw if it doesn't collide with flow
+    if map_state and map_y > y:
         if map_state.get('learning_mode'):
-            prog     = map_state.get('learning_progress', 0)
-            bar_w2   = yw
-            filled2  = int(bar_w2 * prog / 100)
-            # Label
+            prog    = map_state.get('learning_progress', 0)
+            bar_w2  = yw
+            filled2 = int(bar_w2 * prog / 100)
             cv2.putText(vis, "ROOM MAPPING", (px + 10, map_y),
                         FONT, 0.32, (75, 88, 112), 1, cv2.LINE_AA)
             map_y += 14
-            # Progress bar
             cv2.rectangle(vis, (px+10, map_y),
                           (px+10+bar_w2, map_y+10), (25, 30, 40), -1)
             cv2.rectangle(vis, (px+10, map_y),
@@ -561,8 +448,7 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
                           (px+10+bar_w2, map_y+10), (45, 55, 68), 1)
             map_y += 14
             cv2.putText(vis, f"Learning  {prog:.0f}%",
-                        (px + 10, map_y),
-                        FONT, 0.40, (60, 210, 90), 1, cv2.LINE_AA)
+                        (px + 10, map_y), FONT, 0.40, (60, 210, 90), 1, cv2.LINE_AA)
         else:
             ph = map_state.get('persistent_hazards', 0)
             hz = map_state.get('high_risk_zones', 0)
@@ -570,10 +456,8 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
                         FONT, 0.32, (75, 88, 112), 1, cv2.LINE_AA)
             map_y += 14
             cv2.putText(vis, f"{ph} hazards  {hz} zones",
-                        (px + 10, map_y),
-                        FONT, 0.40, (100, 170, 230), 1, cv2.LINE_AA)
+                        (px + 10, map_y), FONT, 0.40, (100, 170, 230), 1, cv2.LINE_AA)
 
-    # ---- Key legend (always at the very bottom) ----
     for i, (k, act) in enumerate(reversed(
             [("Q", "quit"), ("P", "pause"), ("S", "screenshot"),
              ("+/-", "conf"), ("R", "reset")])):
@@ -588,13 +472,13 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
 # ===========================================================================
 class LiveDetector:
     def __init__(self, args):
-        self.args        = args
-        self.conf        = args.conf
-        self.detector    = HazardDetector(args.models, conf=self.conf)
-        self.paused      = False
-        self.frame_count = 0
-        self.fps_history = []
-        self._pulse      = 0
+        self.args         = args
+        self.conf         = args.conf
+        self.detector     = HazardDetector(args.models, conf=self.conf)
+        self.paused       = False
+        self.frame_count  = 0
+        self.fps_history  = []
+        self._pulse       = 0
         self._alert_count = 0
 
         config_path = args.config
@@ -604,45 +488,41 @@ class LiveDetector:
         self.risk_mod  = RiskAssessmentModule(config_path)    if RISK_AVAILABLE     else None
         self.alert_mgr = AlertManager(config_path)            if ALERT_AVAILABLE    else None
 
-        # Room mapper — loads existing map if present, else starts learning
         if MAPPER_AVAILABLE:
             self.room_mapper = AdaptiveRoomMapper()
-            self.room_mapper.load_room_map()   # no-op if map doesn't exist yet
+            self.room_mapper.load_room_map()
         else:
             self.room_mapper = None
 
         self.out_dir = Path('outputs/live_sessions')
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
     def _run_analysis(self, frame, detections):
-        temporal = {'temporal_risk':0.0,'pattern_type':'n/a',
-                    'confidence':0.5,'trajectory':None}
-        spatial  = {'spatial_risk':0.0,'proximity_analysis':None,
-                    'collision_warning':False}
-        risk     = {'risk_score':0.0,'risk_level_name':'SAFE',
-                    'risk_level':'SAFE','risk_level_enum':None,
-                    'should_alert':False,'alert_urgency':'gentle',
-                    'explanation':{'primary_factors':[]}}
+        temporal = {'temporal_risk': 0.0, 'pattern_type': 'n/a',
+                    'confidence': 0.5, 'trajectory': None}
+        spatial  = {'spatial_risk': 0.0, 'proximity_analysis': None,
+                    'collision_warning': False}
+        risk     = {'risk_score': 0.0, 'risk_level_name': 'SAFE',
+                    'risk_level': 'SAFE', 'risk_level_enum': None,
+                    'should_alert': False, 'alert_urgency': 'gentle',
+                    'explanation': {'primary_factors': []}}
 
         if self.temporal:
             try:    temporal = self.temporal.analyze(detections)
-            except Exception as e: pass
+            except Exception: pass
 
         if self.spatial:
             try:    spatial = self.spatial.assess_risk(detections)
-            except Exception as e: pass
+            except Exception: pass
 
         if self.risk_mod:
             try:
                 risk = self.risk_mod.assess_comprehensive_risk(
                     detections, temporal, spatial, frame)
-            except Exception as e: pass
+            except Exception: pass
 
-        # Update room map every frame (learning or monitoring)
         if self.room_mapper:
             try:
-                # Flatten detections list for mapper (expects list of dicts)
                 flat = [d for dets in detections.values() for d in dets]
                 self.room_mapper.process_frame_for_mapping(frame, flat)
             except Exception:
@@ -650,7 +530,6 @@ class LiveDetector:
 
         return temporal, spatial, risk
 
-    # ------------------------------------------------------------------
     def _handle_alert(self, risk, detections):
         if not self.alert_mgr or not risk.get('should_alert'):
             return
@@ -661,13 +540,10 @@ class LiveDetector:
             status = self.alert_mgr.send_alert(alert)
             if not status.get('suppressed'):
                 self._alert_count += 1
-        except Exception as e:
+        except Exception:
             pass
 
-    # ------------------------------------------------------------------
     def _build_display(self, frame, detections, temporal, spatial, risk, fps):
-        # Apply room-map overlay first (heatmap + persistent hazard boxes +
-        # "Learning Room: X%" banner) so detection boxes draw on top of it.
         if self.room_mapper:
             try:
                 frame = self.room_mapper.visualize_room_map(frame)
@@ -683,13 +559,11 @@ class LiveDetector:
         if child_bbox_vis is None and detections.get('child'):
             child_bbox_vis = detections['child'][0]['bbox']
 
-        for key in ('fire', 'pool'):
-            if detections.get(key):
-                vis = draw_proximity_zones(
-                    vis, detections[key][0]['center'],
-                    child_bbox=child_bbox_vis,
-                    pulse=self._pulse)
-                break
+        if detections.get('fire'):
+            vis = draw_proximity_zones(
+                vis, detections['fire'][0]['center'],
+                child_bbox=child_bbox_vis,
+                pulse=self._pulse)
 
         if temporal.get('trajectory') is not None:
             h, w = vis.shape[:2]
@@ -727,7 +601,6 @@ class LiveDetector:
 
         return vis
 
-    # ------------------------------------------------------------------
     def run(self):
         source = self.args.video if self.args.video else self.args.camera
         cap    = cv2.VideoCapture(source)
@@ -746,6 +619,7 @@ class LiveDetector:
         print(f"  Resolution : {w_src}x{h_src}  @{fps_src:.0f}fps")
         print(f"  Frames     : {total if total>0 else 'live'}")
         print(f"  Mode       : {'DEMO' if self.detector._use_demo else 'LIVE'}")
+        print(f"  Hazards    : fire only (pool removed)")
         print(f"{'='*60}\n")
 
         writer = None
@@ -790,7 +664,7 @@ class LiveDetector:
                 if frame is _STOP:
                     result_q.put(_STOP)
                     return
-                det, frame   = self.detector.detect(frame)  # unpack (dets, frame)
+                det, frame    = self.detector.detect(frame)
                 tmp, spa, rsk = self._run_analysis(frame, det)
                 self._handle_alert(rsk, det)
                 if not is_file:
@@ -807,7 +681,6 @@ class LiveDetector:
 
         if not self.args.no_display:
             cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
-            # Sensible default: show at least 1024 wide, preserve aspect ratio
             disp_w = max(w_src, 1024)
             disp_h = int(disp_w * h_src / max(w_src, 1)) if w_src else 576
             cv2.resizeWindow(WIN_TITLE, disp_w, disp_h)
@@ -861,9 +734,9 @@ class LiveDetector:
                         break
 
                 if self.frame_count % 60 == 0:
-                    rl  = rsk.get('risk_level_name','SAFE')
-                    rs  = rsk.get('risk_score', 0.0)
-                    nc  = sum(len(v) for v in det.values())
+                    rl = rsk.get('risk_level_name', 'SAFE')
+                    rs = rsk.get('risk_score', 0.0)
+                    nc = sum(len(v) for v in det.values())
                     print(f"  [{self.frame_count:5d}] fps={avg_fps:.1f}  "
                           f"risk={rl}({rs:.3f})  dets={nc}  alerts={self._alert_count}")
 
@@ -878,7 +751,6 @@ class LiveDetector:
             cv2.destroyAllWindows()
             self._print_summary()
 
-    # ------------------------------------------------------------------
     def _handle_key(self, key, frame):
         if key == ord('q'): return True
         if key == ord('p'):
@@ -893,11 +765,11 @@ class LiveDetector:
             if self.spatial:  self.spatial.proximity_history.clear()
             print("[INFO] History reset.")
         elif key == ord('+'):
-            self.conf = min(0.95, self.conf+0.05)
+            self.conf = min(0.95, self.conf + 0.05)
             self.detector.conf = self.conf
             print(f"[INFO] Conf -> {self.conf:.2f}")
         elif key == ord('-'):
-            self.conf = max(0.05, self.conf-0.05)
+            self.conf = max(0.05, self.conf - 0.05)
             self.detector.conf = self.conf
             print(f"[INFO] Conf -> {self.conf:.2f}")
         return False
@@ -912,7 +784,7 @@ class LiveDetector:
         print(f"  Alerts   : {self._alert_count}")
         if self.alert_mgr:
             stats = self.alert_mgr.get_alert_statistics()
-            for lvl, cnt in stats.get('by_level',{}).items():
+            for lvl, cnt in stats.get('by_level', {}).items():
                 print(f"    {lvl:12s}: {cnt}")
         print(f"{'='*60}\n")
 

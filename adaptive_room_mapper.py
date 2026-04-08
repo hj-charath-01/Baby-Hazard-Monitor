@@ -1,21 +1,6 @@
 """
 Adaptive Room Mapping with Spatial Hazard Learning
-Self-learning system that maps rooms and identifies persistent hazard locations
-
-Patent Features:
-- Automated room layout mapping
-- Persistent hazard location identification
-- Dynamic hazard detection (temporary hazards)
-- 3D depth-based distance estimation
-- Movement pattern analysis
-- High-risk zone identification
-
-FIXED BUGS:
-- Removed hardcoded 1280/12.8 and 720/7.2 magic numbers in
-  _update_hazard_locations and _update_movement_heatmap; frame dimensions
-  are now read from the actual frame shape so the mapper works at any
-  resolution.
-- pixel_to_meter_ratio aligned with spatial_analysis.py (40 px/m).
+Pool detection removed.
 """
 
 import cv2
@@ -28,13 +13,6 @@ import pickle
 
 
 class AdaptiveRoomMapper:
-    """
-    Self-learning spatial hazard detection system.
-
-    Patent Claim: Automated room layout mapping via camera movement with
-    persistent hazard location identification.
-    """
-
     def __init__(self, config_path='config/room_mapping_config.yaml'):
         self.config = self._load_config(config_path)
 
@@ -55,7 +33,7 @@ class AdaptiveRoomMapper:
         self.heatmap_resolution = (100, 100)
 
         self.feature_points = []
-        self.orb = cv2.ORB_create(nfeatures=500)   # was 1000 — halved for speed
+        self.orb = cv2.ORB_create(nfeatures=500)
 
         self.camera_matrix = None
         self.dist_coeffs   = None
@@ -64,30 +42,21 @@ class AdaptiveRoomMapper:
         self.frames_processed         = 0
         self.learning_duration_frames = self.config.get('learning_frames', 900)
 
-        # Cached frame size — filled on first frame; no hardcoded dimensions.
         self._frame_w = None
         self._frame_h = None
 
         print("Adaptive Room Mapper Initialized")
         print(f"Learning Mode: Enabled ({self.learning_duration_frames} frames)")
-        print(f"Heatmap Resolution: {self.heatmap_resolution}")
 
-    # ------------------------------------------------------------------
     def _load_config(self, config_path):
         default_config = {
-            # --- SPEED-UP DEFAULTS ---
-            # 900 frames  = ~30 s at 30 fps  (was 7200 / 4 min)
             'learning_frames':              900,
-            # 15 sightings to lock a hazard  (was 100)
             'persistent_threshold':         15,
-            # Early-finish: if a hazard is seen this many times we consider
-            # the map "good enough" and don't wait for learning_frames.
             'early_finish_sightings':       40,
             'movement_decay':               0.92,
             'hazard_persistence_threshold': 0.6,
             'enable_depth_estimation':      True,
             'pixel_to_meter_ratio':         40,
-            # Run ORB feature extraction only every N frames (was every frame)
             'orb_every_n_frames':           10,
         }
         try:
@@ -98,26 +67,21 @@ class AdaptiveRoomMapper:
         except Exception:
             return default_config
 
-    # ------------------------------------------------------------------
     def _cache_frame_size(self, frame):
         if self._frame_h is None:
             self._frame_h, self._frame_w = frame.shape[:2]
 
-    # ------------------------------------------------------------------
     def process_frame_for_mapping(self, frame, detections):
-        """Process frame to build room map."""
         self._cache_frame_size(frame)
         self.frames_processed += 1
 
         if self.learning_mode:
-            # ORB is slow — only run every N frames
             if self.frames_processed % self.config.get('orb_every_n_frames', 10) == 0:
                 self._extract_spatial_features(frame)
 
             self._update_hazard_locations(frame, detections)
             self._update_movement_heatmap(frame, detections)
 
-            # Early-finish: enough confident persistent sightings already
             early = self.config.get('early_finish_sightings', 40)
             max_sightings = max(
                 (len(v) for v in self.hazard_history.values()), default=0)
@@ -135,7 +99,6 @@ class AdaptiveRoomMapper:
 
         return self.get_current_map_state()
 
-    # ------------------------------------------------------------------
     def _extract_spatial_features(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         keypoints, _ = self.orb.detectAndCompute(gray, None)
@@ -145,19 +108,14 @@ class AdaptiveRoomMapper:
             'timestamp': datetime.now().isoformat(),
         })
 
-    # ------------------------------------------------------------------
     def _update_hazard_locations(self, frame, detections):
-        """Track hazard locations over time.
-
-        BUG FIX: Grid-cell calculation now uses actual frame dimensions
-        instead of hardcoded 1280/720 values.
-        """
         h, w = frame.shape[:2]
         cell_w = w / self.heatmap_resolution[1]
         cell_h = h / self.heatmap_resolution[0]
 
+        # Only fire remains as a tracked hazard class
         for det in detections:
-            if det['class_name'] not in ['fire', 'pool', 'stove', 'sharp_object']:
+            if det['class_name'] not in ['fire', 'stove', 'sharp_object']:
                 continue
             bbox = det['bbox']
             center_x = (bbox[0] + bbox[2]) / 2
@@ -174,13 +132,7 @@ class AdaptiveRoomMapper:
                 'frame':      self.frames_processed,
             })
 
-    # ------------------------------------------------------------------
     def _update_movement_heatmap(self, frame, detections):
-        """Update child movement heatmap.
-
-        BUG FIX: Grid conversion now uses actual frame dimensions instead
-        of hardcoded 1280/720 values.
-        """
         if self.movement_heatmap is None:
             self.movement_heatmap = np.zeros(self.heatmap_resolution, dtype=np.float32)
 
@@ -197,19 +149,16 @@ class AdaptiveRoomMapper:
 
             grid_x = int((center_x / w) * self.heatmap_resolution[1])
             grid_y = int((center_y / h) * self.heatmap_resolution[0])
-
             grid_x = max(0, min(self.heatmap_resolution[1] - 1, grid_x))
             grid_y = max(0, min(self.heatmap_resolution[0] - 1, grid_y))
 
             self.movement_heatmap[grid_y, grid_x] += 1.0
             updated = True
 
-        # Blur only every 5 frames to reduce CPU overhead
         if updated and self.frames_processed % 5 == 0:
             self.movement_heatmap = cv2.GaussianBlur(
                 self.movement_heatmap, (5, 5), 0)
 
-    # ------------------------------------------------------------------
     def _finalize_room_map(self):
         print("\nFinalizing Room Map...")
         self.learning_mode = False
@@ -236,7 +185,6 @@ class AdaptiveRoomMapper:
         print(f"  Persistent Hazards : {len(self.room_map['persistent_hazards'])}")
         print(f"  High-Risk Zones    : {len(self.room_map.get('high_risk_zones', []))}")
 
-    # ------------------------------------------------------------------
     def _cluster_hazard_locations(self, history):
         clusters = defaultdict(list)
         for detection in history:
@@ -248,14 +196,13 @@ class AdaptiveRoomMapper:
                 avg_bbox = np.mean([d['bbox'] for d in dets], axis=0)
                 avg_conf = np.mean([d['confidence'] for d in dets])
                 result.append({
-                    'center':          location,
-                    'count':           len(dets),
-                    'bbox':            avg_bbox.tolist(),
-                    'avg_confidence':  float(avg_conf),
+                    'center':         location,
+                    'count':          len(dets),
+                    'bbox':           avg_bbox.tolist(),
+                    'avg_confidence': float(avg_conf),
                 })
         return result
 
-    # ------------------------------------------------------------------
     def _identify_high_risk_zones(self):
         if self.movement_heatmap is None:
             return
@@ -277,20 +224,19 @@ class AdaptiveRoomMapper:
                             0 <= y < self.heatmap_resolution[0]):
                         if high_movement[y, x]:
                             high_risk_zones.append({
-                                'location':         (x, y),
-                                'hazard_type':      hazard['type'],
+                                'location':           (x, y),
+                                'hazard_type':        hazard['type'],
                                 'movement_intensity': float(normalized[y, x]),
-                                'risk_score':        float(normalized[y, x] *
-                                                           hazard['confidence']),
+                                'risk_score':         float(normalized[y, x] *
+                                                            hazard['confidence']),
                             })
 
         self.room_map['high_risk_zones'] = high_risk_zones
 
-    # ------------------------------------------------------------------
     def _detect_dynamic_hazards(self, detections):
         for det in detections:
             hazard_type = det['class_name']
-            if hazard_type not in ['fire', 'pool', 'water', 'sharp_object']:
+            if hazard_type not in ['fire', 'water', 'sharp_object']:
                 continue
 
             bbox     = det['bbox']
@@ -314,29 +260,26 @@ class AdaptiveRoomMapper:
                 })
                 print(f"Dynamic Hazard Detected: {hazard_type} at ({center_x:.0f}, {center_y:.0f})")
 
-    # ------------------------------------------------------------------
     def estimate_distance_to_hazard(self, child_bbox, hazard_bbox):
         child_c  = [(child_bbox[0] + child_bbox[2]) / 2,
                     (child_bbox[1] + child_bbox[3]) / 2]
         hazard_c = [(hazard_bbox[0] + hazard_bbox[2]) / 2,
                     (hazard_bbox[1] + hazard_bbox[3]) / 2]
 
-        pixel_dist  = np.sqrt((child_c[0] - hazard_c[0])**2 +
-                              (child_c[1] - hazard_c[1])**2)
-        meter_dist  = pixel_dist / self.config['pixel_to_meter_ratio']
-
-        child_area  = ((child_bbox[2] - child_bbox[0]) *
-                       (child_bbox[3] - child_bbox[1]))
+        pixel_dist   = np.sqrt((child_c[0] - hazard_c[0])**2 +
+                               (child_c[1] - hazard_c[1])**2)
+        meter_dist   = pixel_dist / self.config['pixel_to_meter_ratio']
+        child_area   = ((child_bbox[2] - child_bbox[0]) *
+                        (child_bbox[3] - child_bbox[1]))
         depth_factor = 1.0 / (child_area / 10000 + 1)
         estimated    = meter_dist * depth_factor
 
         return {
-            'pixel_distance':  pixel_dist,
+            'pixel_distance':   pixel_dist,
             'estimated_meters': estimated,
             'depth_adjusted':   True,
         }
 
-    # ------------------------------------------------------------------
     def get_current_map_state(self):
         return {
             'learning_mode':      self.learning_mode,
@@ -345,10 +288,9 @@ class AdaptiveRoomMapper:
             'temporary_hazards':  len(self.room_map['temporary_hazards']),
             'high_risk_zones':    len(self.room_map.get('high_risk_zones', [])),
             'learning_progress':  min(100, (self.frames_processed /
-                                           self.learning_duration_frames) * 100),
+                                            self.learning_duration_frames) * 100),
         }
 
-    # ------------------------------------------------------------------
     def visualize_room_map(self, frame):
         vis = frame.copy()
 
@@ -382,7 +324,6 @@ class AdaptiveRoomMapper:
 
         return vis
 
-    # ------------------------------------------------------------------
     def _save_room_map(self):
         map_path = Path('config/room_map.json')
         map_path.parent.mkdir(exist_ok=True)
@@ -412,10 +353,10 @@ class AdaptiveRoomMapper:
             info = self.estimate_distance_to_hazard(child_bbox, hazard['bbox'])
             if info['estimated_meters'] < 1.0:
                 alerts.append({
-                    'hazard_type':      hazard['type'],
-                    'distance_meters':  info['estimated_meters'],
-                    'severity':         'critical' if info['estimated_meters'] < 0.5
-                                        else 'warning',
-                    'hazard_location':  hazard['bbox'],
+                    'hazard_type':     hazard['type'],
+                    'distance_meters': info['estimated_meters'],
+                    'severity':        'critical' if info['estimated_meters'] < 0.5
+                                       else 'warning',
+                    'hazard_location': hazard['bbox'],
                 })
         return alerts

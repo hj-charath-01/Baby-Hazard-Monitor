@@ -1,26 +1,3 @@
-"""
-Caregiver Attention Estimation Module
-=====================================
-Patent Claim: Supervised-vs-distracted supervision modifier for child hazard risk.
-
-Method:
-  1. Detect any adult present in the frame (class 'person' filtered by size/position).
-  2. Estimate head-pose yaw via facial landmark geometry (OpenCV fallback) or a
-     lightweight dlib/mediapipe model when available.
-  3. Classify attention state: WATCHING | PERIPHERAL | DISTRACTED | ABSENT.
-  4. Return a continuous attention score ∈ [0, 1] and a risk multiplier.
-
-Integration point:
-  RiskAssessmentModule.assess_comprehensive_risk() applies this multiplier
-  to the base risk score when a child is in a WARNING or CRITICAL zone.
-
-Novel aspect vs. prior art:
-  Existing baby monitors detect presence of caregiver but do NOT estimate
-  gaze direction or weight risk by supervision quality.  This module makes
-  the risk score a function of (hazard proximity × caregiver attention),
-  which has not appeared in filed patents as of the knowledge cutoff.
-"""
-
 import cv2
 import numpy as np
 from collections import deque
@@ -72,19 +49,22 @@ class HeadPoseEstimator:
         self.face_cascade = cv2.CascadeClassifier(face_cascade_path)
         self.eye_cascade  = cv2.CascadeClassifier(eye_cascade_path)
 
-        # Try mediapipe for better landmark quality
         self._mp_face = None
         try:
             import mediapipe as mp
-            self._mp_face = mp.solutions.face_mesh.FaceMesh(
+            solutions = getattr(mp, 'solutions', None)
+            if solutions is None:
+                raise AttributeError("mediapipe.solutions not available in this version")
+            self._mp_face = solutions.face_mesh.FaceMesh(
                 static_image_mode=False,
                 max_num_faces=3,
                 refine_landmarks=True,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
-        except ImportError:
-            pass
+        except (ImportError, AttributeError, Exception):
+            # Fall back to OpenCV-only head-pose estimation
+            self._mp_face = None
 
     def estimate_yaw(self, frame, face_bbox):
         """
@@ -99,7 +79,7 @@ class HeadPoseEstimator:
         if face_roi.size == 0:
             return 0.0, 0.0
 
-        # --- MediaPipe path (preferred) ---
+        # MediaPipe path 
         if self._mp_face is not None:
             try:
                 rgb = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
@@ -111,7 +91,7 @@ class HeadPoseEstimator:
             except Exception:
                 pass
 
-        # --- OpenCV fallback: eye-symmetry heuristic ---
+        # OpenCV fallback: eye-symmetry heuristic 
         gray     = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
         eyes     = self.eye_cascade.detectMultiScale(gray, 1.1, 5, minSize=(15, 15))
         if len(eyes) >= 2:

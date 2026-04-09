@@ -1,35 +1,3 @@
-"""
-Cross-Session Hazard Habituation Detector
-==========================================
-Patent Claim: A method for tracking whether a child repeatedly approaches
-the same persistent hazard across multiple monitoring sessions and, upon
-detecting an increasing approach-frequency trend (habituation or developing
-curiosity), automatically escalating that hazard's persistent risk weight
-in the room map.
-
-Novel aspect vs. prior art:
-  Existing spatial mapping systems record hazard locations but treat each
-  detection event independently.  This module introduces a *behavioural
-  learning loop*: it accumulates cross-session approach events per hazard,
-  fits a trend to the inter-session approach counts, and raises a hazard's
-  risk weight when the trend is positive (child is approaching more
-  frequently over time, not less).
-
-Key concepts:
-  - "Approach event" : child centroid enters the WARNING zone of a known
-    persistent hazard and moves toward it (proximity decreasing).
-  - "Session"        : one continuous monitoring run (app start → stop).
-  - "Habituation"    : approach count per session is non-decreasing over
-    the last N sessions, suggesting the child is no longer deterred.
-  - Risk weight bump : the hazard's base confidence/weight is scaled by
-    HABITUATION_WEIGHT_SCALE when habituation is detected.
-
-Data persistence:
-  All cross-session data is stored in JSON at the path configured in
-  ``HABITUATION_DB_PATH``.  The room mapper's persistent_hazards list
-  is augmented in-place with updated risk weights.
-"""
-
 from __future__ import annotations
 
 import json
@@ -287,9 +255,7 @@ class HazardHabituationDetector:
     def _generate_session_id() -> str:
         return f"S_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    # ------------------------------------------------------------------
     # Persistence
-    # ------------------------------------------------------------------
 
     def _load_db(self) -> dict:
         if HABITUATION_DB_PATH.exists():

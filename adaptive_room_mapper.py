@@ -1,6 +1,5 @@
 """
 Adaptive Room Mapping with Spatial Hazard Learning
-Pool detection removed.
 """
 
 import cv2
@@ -113,7 +112,6 @@ class AdaptiveRoomMapper:
         cell_w = w / self.heatmap_resolution[1]
         cell_h = h / self.heatmap_resolution[0]
 
-        # Only fire remains as a tracked hazard class
         for det in detections:
             if det['class_name'] not in ['fire', 'stove', 'sharp_object']:
                 continue

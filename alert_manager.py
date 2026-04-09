@@ -1,15 +1,3 @@
-"""
-Alert Management System  (v2 — Patent Edition)
-===============================================
-New in v2:
-  • AdaptiveAlertCadence integration (Patent: self-tuning cooldown based on
-    caregiver response latency / alert fatigue detection).
-  • acknowledge_alert() now feeds response latency back to the cadence engine.
-  • create_alert() uses cadence-derived urgency when risk assessment is 'gentle'.
-
-Pool detection removed.  Fire is the only tracked hazard type.
-"""
-
 import time
 from datetime import datetime, timedelta
 from collections import deque
@@ -69,17 +57,13 @@ class AlertManager:
         self.log_dir = Path('logs/alerts')
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        # ----------------------------------------------------------------
-        # Patent module: Adaptive alert cadence
-        # ----------------------------------------------------------------
+        # Adaptive alert cadence
         self.cadence: AdaptiveAlertCadence | None = (
             AdaptiveAlertCadence(base_cooldown=self._static_cooldown)
             if CADENCE_AVAILABLE else None
         )
 
-    # ------------------------------------------------------------------
     # Cooldown / should-send logic
-    # ------------------------------------------------------------------
 
     def should_send_alert(self, alert_type: str, current_level: int):
         """
@@ -89,7 +73,7 @@ class AlertManager:
         if current_level == AlertLevel.EMERGENCY:
             return True, "Emergency — no cooldown"
 
-        # ---- Patent: use adaptive cooldown ----
+        # use adaptive cooldown 
         if self.cadence:
             effective_cooldown, _, meta = self.cadence.get_params(alert_type)
         else:
@@ -109,15 +93,13 @@ class AlertManager:
 
         return True, "Normal alert conditions met"
 
-    # ------------------------------------------------------------------
     # Alert creation
-    # ------------------------------------------------------------------
 
     def create_alert(self, assessment: dict, detections: dict) -> dict:
         base_urgency = assessment.get('alert_urgency', 'gentle')
         alert_type   = self._determine_alert_type(detections)
 
-        # ---- Patent: cadence may bump urgency based on response history ----
+        # cadence may bump urgency based on response history 
         if self.cadence:
             _, cadence_urgency, meta = self.cadence.get_params(alert_type)
             # Use the higher urgency of assessment vs. cadence recommendation
@@ -146,7 +128,6 @@ class AlertManager:
             'detections':          detections,
             'acknowledged':        False,
             'resolved':            False,
-            # Patent-novel fields
             'attention_state':     assessment.get('attention_state'),
             'developmental_stage': assessment.get('developmental_stage'),
             'habituation_active':  assessment.get('habituation_active', False),
@@ -163,9 +144,7 @@ class AlertManager:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"ALERT_{ts}_{len(self.alert_history)}"
 
-    # ------------------------------------------------------------------
     # Sending
-    # ------------------------------------------------------------------
 
     def send_alert(self, alert: dict) -> dict:
         alert_type  = alert['type']
@@ -197,7 +176,7 @@ class AlertManager:
         self._log_alert(alert, delivery_status)
         self.alert_history.append(alert)
 
-        # ---- Patent: record send event in cadence engine ----
+        # record send event in cadence engine 
         if self.cadence:
             self.cadence.record_sent(
                 alert['id'], alert_type,
@@ -206,12 +185,10 @@ class AlertManager:
 
         return delivery_status
 
-    # ------------------------------------------------------------------
     # Notifications
-    # ------------------------------------------------------------------
 
     def _send_mobile_notification(self, alert: dict) -> dict:
-        # Build contextual subtitle from patent-novel fields
+        # Build contextual subtitle 
         subtitle_parts = []
         if alert.get('attention_state') == 'distracted':
             subtitle_parts.append("Caregiver distracted")
@@ -263,9 +240,7 @@ class AlertManager:
             msg += f"\n[Alert cadence tightened — avg response {cadence.get('avg_latency_s',0):.0f}s]"
         return msg
 
-    # ------------------------------------------------------------------
     # Acknowledgement — feeds back into cadence engine
-    # ------------------------------------------------------------------
 
     def acknowledge_alert(self, alert_id: str) -> bool:
         for alert in self.alert_history:
@@ -273,7 +248,7 @@ class AlertManager:
                 alert['acknowledged']    = True
                 alert['acknowledged_at'] = datetime.now().isoformat()
 
-                # ---- Patent: feed response latency to cadence engine ----
+                # feed response latency to cadence engine 
                 if self.cadence:
                     latency = self.cadence.record_ack(alert_id)
                     if latency is not None:
@@ -285,9 +260,7 @@ class AlertManager:
                 return True
         return False
 
-    # ------------------------------------------------------------------
     # Resolve / escalate
-    # ------------------------------------------------------------------
 
     def resolve_alert(self, alert_id: str, resolution_note=None) -> bool:
         for alert in self.alert_history:
@@ -316,7 +289,6 @@ class AlertManager:
                 alert['escalation_time'] = datetime.now().isoformat()
                 print(f"\nALERT ESCALATION: {alert['id']} → {alert['level_name']}")
 
-                # Also expire in cadence engine (counts as very slow response)
                 if self.cadence:
                     self.cadence.expire_unacknowledged(timeout_s=self.escalation_time)
 
@@ -325,9 +297,7 @@ class AlertManager:
 
         return escalated
 
-    # ------------------------------------------------------------------
     # Logging / statistics
-    # ------------------------------------------------------------------
 
     def _log_alert(self, alert: dict, delivery_status: dict):
         log_entry = {
@@ -383,5 +353,5 @@ class AlertManager:
             'resolution_rate':     resolved / total,
             'active_alerts':       len(self.active_alerts),
             'avg_response_latency_s': avg_latency,
-            'cadence_report':      cadence_report,   # Patent-novel field
+            'cadence_report':      cadence_report,  
         }

@@ -1,14 +1,3 @@
-"""
-Spatial Analysis Module
-
-FIXED BUGS:
-- Added .get() guards for 'spatial' config key
-- Fixed velocity history shared across instances
-- Fixed division-by-zero in classify_proximity_zone
-- pixel_to_meter_ratio default 40 (40 px ≈ 1 m)
-- Pool detection removed throughout
-"""
-
 import numpy as np
 import cv2
 from collections import deque
@@ -24,20 +13,20 @@ class SpatialAnalyzer:
             self.config = {}
 
         spatial_cfg = self.config.get('spatial', {})
-
         zones_cfg = spatial_cfg.get('proximity_zones', {})
         self.zones = {
             'critical': zones_cfg.get('critical', 1.0),
             'warning':  zones_cfg.get('warning',  2.5),
             'safe':     zones_cfg.get('safe',     5.0),
         }
-
         traj_cfg = spatial_cfg.get('trajectory', {})
-        self.prediction_frames  = traj_cfg.get('prediction_frames',  30)
+        # FIX: default raised from 30 → 90 frames (= 3 seconds at 30 fps).
+        # 30 frames (1 s) was too short: a child moving at typical toddler speed
+        # (~10 px/frame) needs ~36 frames to close a 1-metre gap, so imminent
+        # collisions were never detected with the old default.
+        self.prediction_frames  = traj_cfg.get('prediction_frames',  90)
         self.velocity_threshold = traj_cfg.get('velocity_threshold', 0.02)
-
         self.pixel_to_meter_ratio = spatial_cfg.get('pixel_to_meter_ratio', 40)
-
         self.position_history: deque = deque(maxlen=10)
 
     def calculate_distance(self, point1, point2):
@@ -58,24 +47,20 @@ class SpatialAnalyzer:
         crit = self.zones['critical']
         warn = self.zones['warning']
         safe = self.zones['safe']
-
         if distance_meters <= crit:
             return 'critical', 1.0
-
         if distance_meters <= warn:
             span = warn - crit
             if span == 0:
                 return 'warning', 0.5
             score = 0.5 + 0.5 * (warn - distance_meters) / span
             return 'warning', float(score)
-
         if distance_meters <= safe:
             span = safe - warn
             if span == 0:
                 return 'safe', 0.0
             score = 0.5 * (safe - distance_meters) / span
             return 'safe', float(score)
-
         return 'safe', 0.0
 
     def analyze_child_hazard_proximity(self, child_detections, hazard_detections):
@@ -88,11 +73,9 @@ class SpatialAnalyzer:
                 'all_distances':    [],
                 'child_position':   (0, 0),
             }
-
         child        = max(child_detections, key=lambda x: x.get('area', 0))
         child_center = child['center']
         child_bbox   = child.get('bbox')
-
         distances = []
         for hazard in hazard_detections:
             hazard_bbox = hazard.get('bbox')
@@ -100,16 +83,11 @@ class SpatialAnalyzer:
                 d_px, d_m = self.bbox_edge_distance(child_bbox, hazard_bbox)
             else:
                 d_px, d_m = self.calculate_distance(child_center, hazard['center'])
-
             zone, zone_score = self.classify_proximity_zone(d_m)
             distances.append({
-                'hazard':          hazard,
-                'distance_pixels': d_px,
-                'distance_meters': d_m,
-                'zone':            zone,
-                'zone_score':      zone_score,
+                'hazard': hazard, 'distance_pixels': d_px,
+                'distance_meters': d_m, 'zone': zone, 'zone_score': zone_score,
             })
-
         closest = min(distances, key=lambda x: x['distance_meters'])
         return {
             'closest_distance': closest['distance_meters'],
@@ -142,23 +120,35 @@ class SpatialAnalyzer:
             vel = vel * 0.95
         return np.array(trajectory)
 
-    def predict_collision_time(self, child_position, child_velocity, hazard_position):
+    def predict_collision_time(self, child_position, child_velocity, hazard_position,
+                               child_bbox=None, hazard_bbox=None):
         child_pos  = np.array(child_position,  dtype=float)
         child_vel  = np.array(child_velocity,  dtype=float)
         hazard_pos = np.array(hazard_position, dtype=float)
-
-        direction = hazard_pos - child_pos
+        direction  = hazard_pos - child_pos
         if np.dot(child_vel, direction) <= 0:
             return None, None
-
         speed = np.linalg.norm(child_vel)
         if speed < 0.01:
             return None, None
-
+        critical_m = self.zones['critical']
         for t in range(self.prediction_frames):
-            pred = child_pos + child_vel * t
-            if np.linalg.norm(pred - hazard_pos) / self.pixel_to_meter_ratio <= self.zones['critical']:
-                return t, tuple(pred)
+            pred_center = child_pos + child_vel * t
+            # FIX: use bbox edge distance when bbox info is available, consistent
+            # with analyze_child_hazard_proximity which uses bbox_edge_distance.
+            # Previously used center-to-center distance, causing the collision
+            # warning to fire at a different threshold than the proximity zone.
+            if child_bbox is not None and hazard_bbox is not None:
+                dx_shift = pred_center[0] - child_pos[0]
+                dy_shift = pred_center[1] - child_pos[1]
+                pred_bbox = [child_bbox[0]+dx_shift, child_bbox[1]+dy_shift,
+                             child_bbox[2]+dx_shift, child_bbox[3]+dy_shift]
+                _, d_m = self.bbox_edge_distance(pred_bbox, hazard_bbox)
+            else:
+                d_px = np.linalg.norm(pred_center - hazard_pos)
+                d_m  = d_px / self.pixel_to_meter_ratio
+            if d_m <= critical_m:
+                return t, tuple(pred_center)
         return None, None
 
     def analyze_approach_pattern(self, proximity_history):
@@ -191,7 +181,7 @@ class SpatialAnalyzer:
         vis = frame.copy()
         for i in range(len(trajectory) - 1):
             cv2.line(vis, tuple(trajectory[i].astype(int)),
-                     tuple(trajectory[i + 1].astype(int)), color, 2)
+                     tuple(trajectory[i+1].astype(int)), color, 2)
         cv2.circle(vis, tuple(trajectory[-1].astype(int)), 5, color, -1)
         return vis
 
@@ -203,37 +193,31 @@ class SpatialRiskAssessment:
 
     def assess_risk(self, detections):
         child_dets  = detections.get('child', [])
-        # Only fire hazards remain
         all_hazards = detections.get('fire', [])
 
         if not child_dets or not all_hazards:
             return {
-                'spatial_risk':       0.0,
-                'proximity_analysis': None,
-                'trajectory':         None,
-                'collision_warning':  False,
-                'collision_time':     None,
-                'approach_pattern':   'unknown',
-                'approach_rate':      0.0,
-                'velocity':           (0, 0),
-                'speed':              0.0,
+                'spatial_risk': 0.0, 'proximity_analysis': None,
+                'trajectory': None, 'collision_warning': False,
+                'collision_time': None, 'approach_pattern': 'unknown',
+                'approach_rate': 0.0, 'velocity': (0, 0), 'speed': 0.0,
             }
 
-        proximity = self.spatial_analyzer.analyze_child_hazard_proximity(
-            child_dets, all_hazards)
-
-        child_pos = proximity['child_position']
+        proximity = self.spatial_analyzer.analyze_child_hazard_proximity(child_dets, all_hazards)
+        child_pos  = proximity['child_position']
         velocity, speed = self.spatial_analyzer.calculate_velocity(child_pos)
 
         trajectory = None
         if speed > 0.01:
             trajectory = self.spatial_analyzer.predict_trajectory(child_pos, velocity)
 
-        collision_time  = None
-        collision_point = None
+        collision_time = collision_point = None
         if trajectory is not None and proximity.get('closest_hazard'):
+            closest_haz = proximity['closest_hazard']
             collision_time, collision_point = self.spatial_analyzer.predict_collision_time(
-                child_pos, velocity, proximity['closest_hazard']['center'])
+                child_pos, velocity, closest_haz['center'],
+                child_bbox  = proximity.get('child_bbox'),
+                hazard_bbox = closest_haz.get('bbox'))
 
         self.proximity_history.append(proximity['closest_distance'])
         if len(self.proximity_history) > 20:
@@ -252,29 +236,19 @@ class SpatialRiskAssessment:
         vx, vy = velocity
         if (abs(vx) > 1 or abs(vy) > 1) and proximity.get('child_bbox'):
             cx1, cy1, cx2, cy2 = proximity['child_bbox']
-            pred_bbox = [
-                cx1 + int(vx * LOOKAHEAD),
-                cy1 + int(vy * LOOKAHEAD),
-                cx2 + int(vx * LOOKAHEAD),
-                cy2 + int(vy * LOOKAHEAD),
-            ]
+            pred_bbox = [cx1+int(vx*LOOKAHEAD), cy1+int(vy*LOOKAHEAD),
+                         cx2+int(vx*LOOKAHEAD), cy2+int(vy*LOOKAHEAD)]
             closest_haz = proximity.get('closest_hazard')
             if closest_haz and closest_haz.get('bbox'):
-                _, pred_dm = self.spatial_analyzer.bbox_edge_distance(
-                    pred_bbox, closest_haz['bbox'])
+                _, pred_dm = self.spatial_analyzer.bbox_edge_distance(pred_bbox, closest_haz['bbox'])
                 _, pred_zone_score = self.spatial_analyzer.classify_proximity_zone(pred_dm)
                 if pred_zone_score > spatial_risk:
                     spatial_risk = min(1.0, pred_zone_score)
 
         return {
-            'spatial_risk':       spatial_risk,
-            'proximity_analysis': proximity,
-            'velocity':           velocity,
-            'speed':              speed,
-            'trajectory':         trajectory,
-            'approach_pattern':   approach_pattern,
-            'approach_rate':      approach_rate,
-            'collision_warning':  collision_time is not None,
-            'collision_time':     collision_time,
-            'collision_point':    collision_point,
+            'spatial_risk': spatial_risk, 'proximity_analysis': proximity,
+            'velocity': velocity, 'speed': speed, 'trajectory': trajectory,
+            'approach_pattern': approach_pattern, 'approach_rate': approach_rate,
+            'collision_warning': collision_time is not None,
+            'collision_time': collision_time, 'collision_point': collision_point,
         }

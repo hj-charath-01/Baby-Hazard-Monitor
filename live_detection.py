@@ -1,6 +1,5 @@
 """
 Live Video Detection — Baby Hazard Monitoring
-Pool detection removed. Only child + fire.
 """
 
 import argparse
@@ -62,9 +61,7 @@ except Exception as e:
     print(f"[WARNING] adaptive_room_mapper unavailable: {e}")
 
 
-# ===========================================================================
 # Colour palette (BGR)
-# ===========================================================================
 _C = {
     'child':   (50,  220,  50),
     'fire':    (30,   80, 255),
@@ -92,9 +89,7 @@ FONT      = cv2.FONT_HERSHEY_SIMPLEX
 FONT_MONO = cv2.FONT_HERSHEY_DUPLEX
 
 
-# ===========================================================================
 # Detector wrapper
-# ===========================================================================
 class HazardDetector:
     CHILD_CLASSES = {'child', 'person', 'baby', 'toddler'}
     FIRE_CLASSES  = {'fire', 'flame', 'smoke'}
@@ -108,6 +103,7 @@ class HazardDetector:
         self.models    = {}
         self._demo_t   = 0
         self._use_demo = False
+        self.device    = 'cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu'
 
         if YOLO_AVAILABLE:
             self._load_models(Path(model_dir))
@@ -150,40 +146,32 @@ class HazardDetector:
     def _detect_real(self, frame):
         result = {'child': [], 'fire': []}
         h, w   = frame.shape[:2]
-        scale  = self.INFER_WIDTH / w
-        ih     = int(h * scale)
-        small  = cv2.resize(frame, (self.INFER_WIDTH, ih),
-                            interpolation=cv2.INTER_LINEAR)
 
-        BUCKETS  = {'child': 'child', 'fire': 'fire', 'general': None}
-        ALLOWED  = {'child': self.CHILD_CLASSES, 'fire': self.FIRE_CLASSES}
+        BUCKETS = {'child': 'child', 'fire': 'fire', 'general': None}
+        ALLOWED = {'child': self.CHILD_CLASSES, 'fire': self.FIRE_CLASSES}
 
         for task, model in self.models.items():
             bucket   = BUCKETS.get(task)
             min_conf = self.conf if bucket == 'child' else self.HAZARD_CONF
             try:
-                preds = model.predict(small, conf=min_conf, iou=self.iou,
-                                      verbose=False)[0]
+                preds = model(frame, conf=min_conf, iou=self.iou,
+                              verbose=False, device=self.device)[0]
             except Exception:
                 continue
             if preds.boxes is None:
                 continue
 
-            boxes   = preds.boxes.xyxy.cpu().numpy()
-            confs   = preds.boxes.conf.cpu().numpy()
-            cls_ids = preds.boxes.cls.cpu().numpy().astype(int)
-            names   = preds.names
-
-            for box, conf, cls_id in zip(boxes, confs, cls_ids):
-                cn = names.get(cls_id, 'unknown').lower()
-                x1 = max(0,     int(box[0] / scale))
-                y1 = max(0,     int(box[1] / scale))
-                x2 = min(w - 1, int(box[2] / scale))
-                y2 = min(h - 1, int(box[3] / scale))
-                det = dict(bbox=[x1, y1, x2, y2], confidence=float(conf),
-                           class_name=cn, class_id=int(cls_id),
-                           center=((x1+x2)//2, (y1+y2)//2),
-                           area=(x2-x1)*(y2-y1))
+            for box in preds.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(w - 1, x2); y2 = min(h - 1, y2)
+                conf   = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                cn     = model.names[cls_id].lower()
+                det    = dict(bbox=[x1, y1, x2, y2], confidence=conf,
+                              class_name=cn, class_id=cls_id,
+                              center=((x1+x2)//2, (y1+y2)//2),
+                              area=(x2-x1)*(y2-y1))
                 if bucket:
                     if cn in ALLOWED.get(bucket, set()):
                         result[bucket].append(det)
@@ -199,8 +187,8 @@ class HazardDetector:
             u = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
             return inter/u if u else 0.0
 
-        result['fire'] = [h for h in result['fire']
-                          if not any(_iou(h['bbox'], p['bbox']) > 0.35
+        result['fire'] = [f for f in result['fire']
+                          if not any(_iou(f['bbox'], p['bbox']) > 0.35
                                      for p in result['child'])]
         return result
 
@@ -261,22 +249,54 @@ class HazardDetector:
         return result
 
 
-# ===========================================================================
 # Drawing helpers
-# ===========================================================================
 
 def draw_detections(frame, detections):
-    vis = frame.copy()
+    vis     = frame.copy()
+    overlay = frame.copy()
+    h, w    = vis.shape[:2]
+
+    child_boxes = []
+    fire_boxes  = []
+
     for key, dets in detections.items():
         colour = _C.get(key, _C['default'])
         for d in dets:
             x1, y1, x2, y2 = d['bbox']
-            cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 2)
             label = f"{d['class_name'].upper()}  {d['confidence']:.0%}"
-            (lw, lh), _ = cv2.getTextSize(label, FONT, 0.48, 1)
-            cv2.rectangle(vis, (x1, y1-lh-10), (x1+lw+8, y1), colour, -1)
-            cv2.putText(vis, label, (x1+4, y1-4),
-                        FONT, 0.48, (10, 10, 10), 1, cv2.LINE_AA)
+
+            # Semi-transparent filled box
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
+
+            # Solid border
+            cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 2)
+
+            # Label pill
+            (lw, lh), _ = cv2.getTextSize(label, FONT, 0.55, 1)
+            tx, ty = x1, max(y1 - 6, lh + 4)
+            cv2.rectangle(vis, (tx, ty - lh - 4), (tx + lw + 6, ty + 2), colour, -1)
+            cv2.putText(vis, label, (tx + 3, ty - 2),
+                        FONT, 0.55, (10, 10, 10), 1, cv2.LINE_AA)
+
+            if key == 'child':
+                child_boxes.append((x1, y1, x2, y2))
+            elif key in ('fire', 'smoke'):
+                fire_boxes.append((x1, y1, x2, y2))
+
+    # Blend semi-transparent fills
+    cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
+
+    # Danger alert when child + fire both visible
+    if child_boxes and fire_boxes:
+        pulse = int(abs((time.time() % 1.0) - 0.5) * 20)
+        cv2.rectangle(vis, (pulse, pulse), (w - pulse, h - pulse), (0, 0, 255), 4)
+        banner = '!!  DANGER: CHILD NEAR FIRE  !!'
+        (bw, bh), _ = cv2.getTextSize(banner, FONT_MONO, 0.85, 2)
+        bx = (w - bw) // 2
+        cv2.rectangle(vis, (bx - 10, 10), (bx + bw + 10, bh + 22), (0, 0, 200), -1)
+        cv2.putText(vis, banner, (bx, bh + 14),
+                    FONT_MONO, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+
     return vis
 
 
@@ -467,9 +487,7 @@ def draw_hud(frame, risk_level, risk_score, pattern, fps,
     return vis
 
 
-# ===========================================================================
 # Main monitoring loop
-# ===========================================================================
 class LiveDetector:
     def __init__(self, args):
         self.args         = args
@@ -789,9 +807,8 @@ class LiveDetector:
         print(f"{'='*60}\n")
 
 
-# ===========================================================================
 def parse_args():
-    p = argparse.ArgumentParser(description='GuardAI — Live Baby Hazard Detection')
+    p = argparse.ArgumentParser(description='Live Baby Hazard Detection')
     src = p.add_mutually_exclusive_group()
     src.add_argument('--camera', type=int,  default=0)
     src.add_argument('--video',  type=str)
